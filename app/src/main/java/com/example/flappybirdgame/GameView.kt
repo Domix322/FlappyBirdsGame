@@ -59,8 +59,34 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
 
     private val prefs = context.getSharedPreferences("flappy", Context.MODE_PRIVATE)
 
-    // Кнопка смены темы (главное меню).
+    // ---- Звук ----
+    private val sound = SoundEngine(context)
+
+    // ---- Настройки (окно на главном меню) ----
+    private var settingsOpen = false
+    private var activeSlider = 0                 // 0 — нет, 1 — музыка, 2 — звуки
+    private val gearBtn = RectF()                // шестерёнка на главном меню
+    private val panel = RectF()
+    private val closeBtn = RectF()
+    private val musicTrack = RectF()
+    private val soundTrack = RectF()
+    private val musicMuteBtn = RectF()
+    private val soundMuteBtn = RectF()
+    private val settingsThemeBtn = RectF()
+
+    // Кнопка смены темы (теперь живёт внутри окна настроек).
     private val themeBtn = RectF()
+
+    // Палитра шестерёнки/контролов (серые, вне тем).
+    private val gearBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(150, 152, 158) }
+    private val gearInk = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(20, 20, 22) }
+    private val dimPaint = Paint().apply { color = Color.argb(150, 0, 0, 0) }
+    private val ctrlPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(104, 108, 118) }
+    private val knobPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(245, 246, 250) }
+    private val muteOffPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(196, 66, 60) }
+    private val slashPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(250, 250, 250); style = Paint.Style.STROKE
+    }
 
     // ---- Спрайты ----
     private val birdBody = arrayOf(
@@ -82,6 +108,25 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private val wingCol = 2
     private val wingRow = 4
 
+    // Ночная тёмная птица: тот же силуэт, что днём, но перекрашенный; глаз и клюв
+    // смотрят вперёд (вправо), как у дневной версии.
+    private val batBody = arrayOf(
+        "....BBBB.....",
+        "..BBMMMMBB...",
+        ".BMMMDDDDWB..",
+        ".BMDDDDDWPBM.",
+        "BMDDDDDDWPBMM",
+        "BDDDDDDDDDBM.",
+        "BDDDDDDDDDB..",
+        ".BDDDDDDDDB..",
+        ".BBDDDDDDB...",
+        "..BBDDDDBB...",
+        "....BBBB....."
+    )
+    private val batWingUp = arrayOf("..BBB.", ".BBBB.", "BBBB..", "......")
+    private val batWingMid = arrayOf("......", ".BBBB.", "BBBBBB", "......")
+    private val batWingDown = arrayOf("......", "......", "BBB...", ".BBBBB")
+
     private val cloud = arrayOf("..wwww..", ".wwwwww.", "wwwwwwww", ".cccccc.")
 
     // ---- Paint ----
@@ -95,6 +140,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         put('G', Paint().apply { color = Color.rgb(235, 160, 35) })
         put('w', Paint().apply { color = Color.rgb(248, 252, 255) })
         put('c', Paint().apply { color = Color.rgb(210, 230, 248) })
+        put('B', Paint().apply { color = Color.rgb(22, 24, 30) })    // тёмная птица: чёрный контур/крыло
+        put('D', Paint().apply { color = Color.rgb(84, 90, 108) })   // тёмная птица: корпус
+        put('M', Paint().apply { color = Color.rgb(120, 126, 144) }) // тёмная птица: светлый блик/клюв
     }
 
     private val bandPaint = Paint()
@@ -143,6 +191,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private val blitPaint = Paint().apply { isFilterBitmap = false; isDither = false }
     private val textCache = HashMap<String, Bitmap>()
 
+    // Обычный сглаженный шрифт для всего текста, кроме крупных заголовков.
+    private val uiTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+    }
+
     // Звёзды (ночь) — фиксированные, без мерцания.
     private val starPts = arrayOf(
         floatArrayOf(0.14f, 0.12f), floatArrayOf(0.30f, 0.08f), floatArrayOf(0.44f, 0.16f),
@@ -155,6 +208,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         isFocusable = true
         best = prefs.getInt("best", 0)
         nightMode = prefs.getBoolean("night", false)
+        sound.musicVolume = prefs.getFloat("musicVol", 0.6f)
+        sound.soundVolume = prefs.getFloat("soundVol", 0.8f)
+        sound.musicMuted = prefs.getBoolean("musicMuted", false)
+        sound.soundMuted = prefs.getBoolean("soundMuted", false)
+        Thread { sound.init() }.start()   // генерация WAV не должна блокировать UI
     }
 
     private fun setupWorld() {
@@ -169,7 +227,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         birdRadius = w * 0.045f
         birdPixel = birdRadius * 0.185f
         cloudPixel = w * 0.022f
-        themeBtn.set(w * 0.32f, h * 0.75f, w * 0.68f, h * 0.82f)
+        layoutSettings()
 
         applyTheme()
         resetGame()
@@ -222,15 +280,46 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
             tilePaint.color = Color.rgb(122, 128, 140)
             btnPanelPaint.color = Color.rgb(228, 240, 255)
             btnTextColor = Color.rgb(40, 54, 92)
-            obsBody.color = Color.rgb(226, 170, 116)
-            obsEdge.color = Color.rgb(196, 140, 90)
-            obsRoof.color = Color.rgb(150, 100, 60)
-            obsWinLit.color = Color.rgb(255, 246, 205)
-            obsWinDark.color = Color.rgb(176, 126, 84)
+            obsBody.color = Color.rgb(180, 186, 194)   // день: тело дома-препятствия серое
+            obsEdge.color = Color.rgb(150, 156, 164)   // день: боковая грань темнее
+            obsRoof.color = Color.rgb(120, 126, 134)   // день: крыша самая тёмная
+            obsWinLit.color = Color.rgb(224, 228, 234)
+            obsWinDark.color = Color.rgb(138, 144, 152)
             titleTop = Color.rgb(255, 224, 90)       // день: жёлто-оранжевый
             titleBottom = Color.rgb(232, 120, 24)
         }
         textCache.clear()   // цвет заголовка сменился — сбрасываем кэш текста
+    }
+
+    /** Геометрия шестерёнки и окна настроек (зависит от размеров экрана). */
+    private fun layoutSettings() {
+        val g = w * 0.11f
+        gearBtn.set(w - g - w * 0.04f, h * 0.03f, w - w * 0.04f, h * 0.03f + g)
+
+        val pw = w * 0.86f
+        val ph = h * 0.52f
+        val pl = (w - pw) / 2f
+        val pt = (h - ph) / 2f
+        panel.set(pl, pt, pl + pw, pt + ph)
+
+        val cb = pw * 0.10f
+        closeBtn.set(pl + pw - cb - pw * 0.04f, pt + pw * 0.04f, pl + pw - pw * 0.04f, pt + pw * 0.04f + cb)
+
+        val trackLeft = pl + pw * 0.08f
+        val trackRight = pl + pw * 0.64f
+        val trackH = h * 0.014f
+        val musicY = pt + ph * 0.36f
+        val soundY = pt + ph * 0.60f
+        musicTrack.set(trackLeft, musicY - trackH / 2f, trackRight, musicY + trackH / 2f)
+        soundTrack.set(trackLeft, soundY - trackH / 2f, trackRight, soundY + trackH / 2f)
+
+        val ms = ph * 0.12f          // квадратная кнопка мьюта
+        val muteL = pl + pw * 0.74f
+        musicMuteBtn.set(muteL, musicY - ms / 2f, muteL + ms, musicY + ms / 2f)
+        soundMuteBtn.set(muteL, soundY - ms / 2f, muteL + ms, soundY + ms / 2f)
+
+        settingsThemeBtn.set(pl + pw * 0.22f, pt + ph * 0.80f, pl + pw * 0.78f, pt + ph * 0.92f)
+        themeBtn.set(settingsThemeBtn)
     }
 
     private fun resetGame() {
@@ -275,7 +364,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
                 while (iter.hasNext()) {
                     val p = iter.next()
                     p.update(dt, pipeSpeed)
-                    if (!p.passed && p.x + p.width < bird.x) { p.passed = true; score++ }
+                    if (!p.passed && p.x + p.width < bird.x) { p.passed = true; score++; sound.playScore() }
                     if (p.collidesWith(bird.x, bird.y, bird.radius, groundY)) gameOver()
                     if (p.isOffScreen()) iter.remove()
                 }
@@ -296,19 +385,67 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.action == MotionEvent.ACTION_DOWN) {
-            when (state) {
-                State.LOADING -> {}
-                State.READY ->
-                    if (themeBtn.contains(event.x, event.y)) toggleTheme()
-                    else { state = State.PLAYING; bird.reset(bird.y); bird.flap() }
-                State.PLAYING -> bird.flap()
-                State.GAME_OVER -> resetGame()
+        val x = event.x; val y = event.y
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                when (state) {
+                    State.LOADING -> {}
+                    State.READY ->
+                        if (settingsOpen) settingsDown(x, y)
+                        else if (gearBtn.contains(x, y)) settingsOpen = true
+                        else { state = State.PLAYING; bird.reset(bird.y); bird.flap() }
+                    State.PLAYING -> bird.flap()
+                    State.GAME_OVER -> resetGame()
+                }
+                performClick()
+                return true
             }
-            performClick()
-            return true
+            MotionEvent.ACTION_MOVE -> {
+                if (settingsOpen && activeSlider != 0) { sliderTo(x); return true }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (activeSlider != 0) {
+                    prefs.edit()
+                        .putFloat("musicVol", sound.musicVolume)
+                        .putFloat("soundVol", sound.soundVolume)
+                        .apply()
+                    activeSlider = 0
+                }
+                return true
+            }
         }
         return super.onTouchEvent(event)
+    }
+
+    /** Обработка нажатия внутри окна настроек. */
+    private fun settingsDown(x: Float, y: Float) {
+        if (closeBtn.contains(x, y)) { settingsOpen = false; return }
+        if (musicMuteBtn.contains(x, y)) {
+            sound.musicMuted = !sound.musicMuted
+            prefs.edit().putBoolean("musicMuted", sound.musicMuted).apply()
+            sound.applyMusicVolume(); return
+        }
+        if (soundMuteBtn.contains(x, y)) {
+            sound.soundMuted = !sound.soundMuted
+            prefs.edit().putBoolean("soundMuted", sound.soundMuted).apply(); return
+        }
+        if (settingsThemeBtn.contains(x, y)) { toggleTheme(); return }
+        if (hitTrack(musicTrack, x, y)) { activeSlider = 1; sliderTo(x); return }
+        if (hitTrack(soundTrack, x, y)) { activeSlider = 2; sliderTo(x); return }
+        if (!panel.contains(x, y)) settingsOpen = false   // тап мимо окна — закрыть
+    }
+
+    private fun hitTrack(t: RectF, x: Float, y: Float): Boolean {
+        val padY = t.height() * 2f
+        return x >= t.left - t.height() && x <= t.right + t.height() &&
+            y >= t.top - padY && y <= t.bottom + padY
+    }
+
+    private fun sliderTo(x: Float) {
+        val t = if (activeSlider == 1) musicTrack else soundTrack
+        val v = ((x - t.left) / t.width()).coerceIn(0f, 1f)
+        if (activeSlider == 1) { sound.musicVolume = v; sound.applyMusicVolume() }
+        else sound.soundVolume = v
     }
 
     override fun performClick(): Boolean {
@@ -327,6 +464,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         drawGround(canvas)
         if (state != State.LOADING) drawBird(canvas)
         if (state == State.LOADING) drawLoading(canvas) else drawHud(canvas)
+        if (settingsOpen && state == State.READY) drawSettings(canvas)
     }
 
     private fun drawSky(canvas: Canvas) {
@@ -481,8 +619,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         canvas.rotate(Math.toDegrees(tilt.toDouble()).toFloat())
         val ox = -birdBody[0].length * p / 2f
         val oy = -birdBody.size * p / 2f
-        drawSprite(canvas, birdBody, ox, oy, p)
-        val wing = when ((System.currentTimeMillis() / 90) % 4) {
+        val body = if (nightMode) batBody else birdBody
+        drawSprite(canvas, body, ox, oy, p)
+        val phase = (System.currentTimeMillis() / 90) % 4
+        val wing = if (nightMode) when (phase) {
+            0L -> batWingUp; 1L -> batWingMid; 2L -> batWingDown; else -> batWingMid
+        } else when (phase) {
             0L -> wingUp; 1L -> wingMid; 2L -> wingDown; else -> wingMid
         }
         drawSprite(canvas, wing, ox + wingCol * p, oy + wingRow * p, p)
@@ -525,7 +667,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
                 pixelTitle(canvas, "BIRD", w / 2f, h * 0.16f + w * 0.12f * 1.2f, w * 0.12f)
                 centeredText(canvas, "Нажми, чтобы начать", w / 2f, h * 0.60f, w * 0.05f)
                 if (best > 0) centeredText(canvas, "Рекорд: $best", w / 2f, h * 0.67f, w * 0.05f)
-                drawThemeButton(canvas)
+                drawGear(canvas)
             }
             State.PLAYING -> centeredText(canvas, "$score", w / 2f, h * 0.16f, w * 0.14f)
             State.GAME_OVER -> {
@@ -539,14 +681,118 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         }
     }
 
-    private fun drawThemeButton(canvas: Canvas) {
-        val r = themeBtn.height() * 0.28f
-        canvas.drawRoundRect(themeBtn, r, r, btnPanelPaint)
-        centeredText(canvas, "Theme", themeBtn.centerX(), themeBtn.centerY(), themeBtn.height() * 0.5f, btnTextColor)
+    /** Кнопка настроек: серый скруглённый квадрат-фон + чёрная пиксельная шестерёнка. */
+    private fun drawGear(canvas: Canvas) {
+        val bgR = gearBtn.width() * 0.22f
+        canvas.drawRoundRect(gearBtn, bgR, bgR, gearBgPaint)
+
+        val cx = gearBtn.centerX(); val cy = gearBtn.centerY()
+        val r = gearBtn.width() * 0.34f     // уменьшена, чтобы был отступ от краёв фона
+        val tw = r * 0.26f                  // полуширина зуба
+        // 8 зубьев (4 по осям + 4 по диагоналям).
+        canvas.drawRect(cx - tw, cy - r, cx + tw, cy - r * 0.5f, gearInk)
+        canvas.drawRect(cx - tw, cy + r * 0.5f, cx + tw, cy + r, gearInk)
+        canvas.drawRect(cx - r, cy - tw, cx - r * 0.5f, cy + tw, gearInk)
+        canvas.drawRect(cx + r * 0.5f, cy - tw, cx + r, cy + tw, gearInk)
+        val d = r * 0.5f; val ds = r * 0.22f
+        canvas.drawRect(cx - d - ds, cy - d - ds, cx - d + ds, cy - d + ds, gearInk)
+        canvas.drawRect(cx + d - ds, cy - d - ds, cx + d + ds, cy - d + ds, gearInk)
+        canvas.drawRect(cx - d - ds, cy + d - ds, cx - d + ds, cy + d + ds, gearInk)
+        canvas.drawRect(cx + d - ds, cy + d - ds, cx + d + ds, cy + d + ds, gearInk)
+        // Тело + отверстие (серое — как «дырка» на фоне).
+        val br = r * 0.6f
+        canvas.drawRect(cx - br, cy - br, cx + br, cy + br, gearInk)
+        val hr = r * 0.24f
+        canvas.drawRect(cx - hr, cy - hr, cx + hr, cy + hr, gearBgPaint)
+    }
+
+    private fun drawSettings(canvas: Canvas) {
+        canvas.drawRect(0f, 0f, w, h, dimPaint)
+        val pr = panel.height() * 0.06f
+        canvas.drawRoundRect(panel, pr, pr, btnPanelPaint)
+        centeredText(canvas, "Настройки", panel.centerX(), panel.top + panel.height() * 0.11f,
+            panel.height() * 0.08f, btnTextColor)
+
+        drawSlider(canvas, "Музыка", musicTrack, sound.musicVolume, musicMuteBtn, sound.musicMuted)
+        drawSlider(canvas, "Звуки", soundTrack, sound.soundVolume, soundMuteBtn, sound.soundMuted)
+
+        // Кнопка темы внутри настроек.
+        val br = settingsThemeBtn.height() * 0.28f
+        canvas.drawRoundRect(settingsThemeBtn, br, br, ctrlPaint)
+        val themeLabel = if (nightMode) "Тема: Ночь" else "Тема: День"
+        centeredText(canvas, themeLabel, settingsThemeBtn.centerX(), settingsThemeBtn.centerY(),
+            settingsThemeBtn.height() * 0.42f, knobPaint.color)
+
+        // Крестик закрытия.
+        val cr = closeBtn.height() * 0.28f
+        canvas.drawRoundRect(closeBtn, cr, cr, ctrlPaint)
+        centeredText(canvas, "X", closeBtn.centerX(), closeBtn.centerY(), closeBtn.height() * 0.5f, knobPaint.color)
+    }
+
+    private fun drawSlider(canvas: Canvas, label: String, track: RectF, value: Float, mute: RectF, muted: Boolean) {
+        val cy = track.centerY()
+        // Метка над дорожкой + процент справа.
+        val labelSize = panel.height() * 0.06f
+        leftText(canvas, label, track.left, cy - panel.height() * 0.09f, labelSize, btnTextColor)
+        centeredText(canvas, "${(value * 100).toInt()}%", track.right - track.width() * 0.06f,
+            cy - panel.height() * 0.09f, labelSize, btnTextColor)
+        // Дорожка + заполнение + ползунок.
+        val tr = track.height() / 2f
+        canvas.drawRoundRect(track, tr, tr, barBgPaint)
+        val fillW = track.width() * value
+        if (fillW > 0f) canvas.drawRoundRect(
+            RectF(track.left, track.top, track.left + fillW, track.bottom), tr, tr, barFillPaint
+        )
+        val knobX = track.left + fillW
+        val kr = track.height() * 1.5f
+        canvas.drawRect(knobX - kr * 0.5f, cy - kr, knobX + kr * 0.5f, cy + kr, knobPaint)
+        // Кнопка мьюта: динамик; при муте — красный фон и перечёркивание.
+        val mr = mute.height() * 0.24f
+        canvas.drawRoundRect(mute, mr, mr, if (muted) muteOffPaint else ctrlPaint)
+        drawSpeaker(canvas, mute)
+        if (muted) {
+            slashPaint.strokeWidth = mute.height() * 0.12f
+            canvas.drawLine(mute.left + mute.width() * 0.22f, mute.top + mute.height() * 0.22f,
+                mute.right - mute.width() * 0.22f, mute.bottom - mute.height() * 0.22f, slashPaint)
+        }
+    }
+
+    private fun drawSpeaker(canvas: Canvas, b: RectF) {
+        val cx = b.centerX(); val cy = b.centerY()
+        val s = b.height()
+        // Корпус + раструб динамика.
+        canvas.drawRect(cx - s * 0.26f, cy - s * 0.1f, cx - s * 0.12f, cy + s * 0.1f, knobPaint)
+        canvas.drawRect(cx - s * 0.12f, cy - s * 0.2f, cx + s * 0.06f, cy + s * 0.2f, knobPaint)
+        // Звуковые волны.
+        canvas.drawRect(cx + s * 0.14f, cy - s * 0.12f, cx + s * 0.2f, cy + s * 0.12f, knobPaint)
+        canvas.drawRect(cx + s * 0.26f, cy - s * 0.2f, cx + s * 0.32f, cy + s * 0.2f, knobPaint)
     }
 
     private fun centeredText(canvas: Canvas, text: String, cx: Float, cy: Float, size: Float, color: Int = textWhite) =
-        blitText(canvas, buildText(text, size, color, false), cx, cy, size)
+        drawUiText(canvas, text, cx, cy, size, color, Paint.Align.CENTER)
+
+    private fun leftText(canvas: Canvas, text: String, x: Float, cy: Float, size: Float, color: Int = textWhite) =
+        drawUiText(canvas, text, x, cy, size, color, Paint.Align.LEFT)
+
+    /** Обычный текст: тонкая тёмная обводка для читаемости на любом фоне. */
+    private fun drawUiText(canvas: Canvas, text: String, x: Float, cy: Float, size: Float, color: Int, align: Paint.Align) {
+        uiTextPaint.textSize = size
+        uiTextPaint.textAlign = align
+        val fm = uiTextPaint.fontMetrics
+        val baseY = cy - (fm.ascent + fm.descent) / 2f
+        val o = size * 0.06f
+        uiTextPaint.color = Color.BLACK
+        canvas.drawText(text, x - o, baseY, uiTextPaint)
+        canvas.drawText(text, x - o, baseY - o, uiTextPaint)
+        canvas.drawText(text, x + o, baseY + o, uiTextPaint)
+        canvas.drawText(text, x - o, baseY + o, uiTextPaint)
+        canvas.drawText(text, x + o, baseY - o, uiTextPaint)
+        canvas.drawText(text, x + o, baseY, uiTextPaint)
+        canvas.drawText(text, x, baseY - o, uiTextPaint)
+        canvas.drawText(text, x, baseY + o, uiTextPaint)
+        uiTextPaint.color = color
+        canvas.drawText(text, x, baseY, uiTextPaint)
+    }
 
     private fun pixelTitle(canvas: Canvas, text: String, cx: Float, cy: Float, size: Float) =
         blitText(canvas, buildText(text, size, 0, true), cx, cy, size)
@@ -620,9 +866,16 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
 
     fun pause() {
         gameOver()
+        sound.onPause()
     }
 
-    fun resume() {}
+    fun resume() {
+        sound.onResume()
+    }
+
+    fun release() {
+        sound.release()
+    }
 
     private fun stopThread() {
         val t = thread ?: return
