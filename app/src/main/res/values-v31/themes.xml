@@ -1,0 +1,12 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Android 12+: системный сплэш = голубое небо игры + круглая иконка-птица.
+         Название по центру показывает экран загрузки сразу после сплэша. -->
+    <style name="Theme.FlappyBirdGame.Game" parent="Theme.FlappyBirdGame">
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowBackground">@drawable/splash_window</item>
+        <item name="android:windowSplashScreenBackground">@color/sky_blue</item>
+    </style>
+</resources>
