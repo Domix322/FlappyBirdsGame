@@ -28,4 +28,9 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         gameView.resume()
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        gameView.release()
+    }
 }

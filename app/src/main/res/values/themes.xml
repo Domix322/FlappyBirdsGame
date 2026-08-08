@@ -20,5 +20,7 @@
         <item name="windowNoTitle">true</item>
         <item name="android:windowFullscreen">true</item>
         <item name="android:windowContentOverlay">@null</item>
+        <!-- Стартовый фон: небо игры + название по центру. -->
+        <item name="android:windowBackground">@drawable/splash_window</item>
     </style>
 </resources>
