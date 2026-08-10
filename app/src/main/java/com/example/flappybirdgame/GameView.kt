@@ -10,12 +10,17 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.core.content.edit
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withSave
+import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.sin
 import kotlin.random.Random
@@ -29,7 +34,8 @@ import kotlin.random.Random
  */
 class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback {
 
-    private enum class State { LOADING, READY, PLAYING, GAME_OVER }
+    // PAUSED — игра приостановлена кнопкой паузы; всё замирает до возобновления.
+    private enum class State { LOADING, READY, PLAYING, PAUSED, GAME_OVER }
 
     private var thread: GameThread? = null
     private var state = State.LOADING
@@ -56,15 +62,63 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private var score = 0
     private var best = 0
 
-    /** Выбранный скин птицы: 0 — базовая, 1 — человек-паук, 2 — бэтмен. */
+    /** Выбранный скин птицы. Индексы: 0 база, 1 паук, 2 бэтмен, 3 робот, 4 ниндзя, 5 феникс. */
     private var skin = 0
 
-    // ---- Монеты и покупка скинов ----
+    /** Кол-во скинов (для достижения «все скины» и раскладки магазина). */
+    private val skinCount = 6
+
+    // ---- Монеты и разблокировка скинов ----
     private var coins = 0
-    /** Стоимость скинов в монетах (индекс = скин). Базовый бесплатный. */
-    private val skinPrices = intArrayOf(0, 10, 20)
-    /** Открыт ли скин (куплен). Базовый открыт всегда. */
-    private val unlocked = booleanArrayOf(true, false, false)
+    /** Монеты, собранные за текущий забег (для таблицы на экране Game Over). */
+    private var coinsThisRun = 0
+    /**
+     * Сколько труб осталось до следующей трубы с монетой. Монета появляется не на
+     * каждой трубе, а случайно раз в 4–7 труб (см. spawnPipe/resetGame).
+     */
+    private var pipesUntilCoin = 0
+
+    /**
+     * Стоимость скина в монетах (индекс = скин). 0 означает, что скин НЕ
+     * покупается за монеты — он открывается за рекорд (см. skinRecordReq).
+     */
+    private val skinPrices = intArrayOf(0, 10, 20, 35, 0, 0)
+
+    /**
+     * Порог рекорда для разблокировки скина. 0 — скин покупной за монеты.
+     * >0 — скин открывается автоматически, когда лучший счёт достигнет порога.
+     */
+    private val skinRecordReq = intArrayOf(0, 0, 0, 0, 15, 30)
+
+    /** Открыт ли скин (куплен монетами или разблокирован рекордом). База открыта всегда. */
+    private val unlocked = BooleanArray(skinCount) { it == 0 }
+
+    /** true — скин открывается за рекорд (а не покупается за монеты). */
+    private fun isRecordSkin(i: Int) = skinRecordReq[i] > 0
+
+    // ---- Прогресс: задания и достижения ----
+    // Инициализируется в init (после prefs); поэтому val без lateinit.
+    private val progress: Progress
+    /** Названия недавно открытых достижений — всплывающая плашка (title, времяДоСкрытия). */
+    private var achToast: String? = null
+    private var achToastTime = 0f
+
+    // ---- Смена времени суток / погоды ----
+    /** Текущая тема оформления: 0 день, 1 закат, 2 ночь. Меняется по мере роста счёта. */
+    private var themeIndex = 0
+    private val themeCount = 3
+    /** Звёзды для ночной темы: пары (x, y) в долях экрана. Заполняется в setupWorld. */
+    private var starField = FloatArray(0)
+
+    // ---- Частицы (анимации) ----
+    /** Кратковременные эффекты: искры монет, брызги удара, пёрышки взмаха. */
+    private val particles = ArrayList<Particle>()
+
+    // ---- Вибрация (полировка) ----
+    // VIBRATOR_SERVICE помечен deprecated на новых API, но работает на всех
+    // поддерживаемых версиях — этого достаточно для короткого «тик»-отклика.
+    @Suppress("DEPRECATION")
+    private val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
 
     /** Единый замок для синхронизации игрового потока и обработчика касаний. */
     private val lock = Any()
@@ -93,7 +147,17 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private var shopOpen = false
     private val shopBtn = RectF()                // кнопка магазина на главном меню (под шестернёй)
     private val shopBackBtn = RectF()            // стрелка «назад» в магазине
-    private val skinSlots = Array(3) { RectF() } // ряд иконок-скинов в магазине
+    private val skinSlots = Array(skinCount) { RectF() } // сетка иконок-скинов в магазине (2×3)
+
+    // ---- Экран заданий и достижений ----
+    private var trophyOpen = false
+    private val trophyBtn = RectF()              // кнопка «цели» на главном меню (под магазином)
+    private val trophyBackBtn = RectF()          // стрелка «назад» на экране целей
+
+    // ---- Пауза ----
+    private val pauseBtn = RectF()               // кнопка паузы (в игре, правый верх)
+    private val resumeBtn = RectF()              // кнопка «продолжить» в оверлее паузы
+    private val pauseHomeBtn = RectF()           // кнопка «в меню» в оверлее паузы
 
     // Палитра шестерёнки/контролов (серые).
     private val gearBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(150, 152, 158) }
@@ -118,6 +182,14 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private val stripePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(255, 150, 20) }
     // Затемнение поверх закрытого (не купленного) скина.
     private val lockDimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(150, 0, 0, 0) }
+
+    // Палитра экрана целей (задания/достижения): зелёные акценты.
+    private val trophyBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(60, 170, 100) }
+    private val trophyScreenPaint = Paint().apply { color = Color.rgb(48, 96, 150) }
+
+    // Звезда, всплывающая плашка достижения.
+    private val starPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val toastPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(40, 44, 60) }
 
     // Монета: золотой кружок с ободком, внутренним кольцом и бликом.
     private val coinRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(190, 140, 20) }
@@ -182,8 +254,54 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         "....KKKK....."
     )
 
-    // Индекс совпадает с skinPalettes: 0 — базовая, 1 — человек-паук, 2 — бэтмен.
-    private val skinBodies = arrayOf(birdBody, spiderBody, batmanBody)
+    // Робот: металлический корпус, горизонтальный визор (W) вместо глаза,
+    // красный «глазок»-индикатор (O).
+    private val robotBody = arrayOf(
+        "....KKKK.....",
+        "..KKHHHHKK...",
+        ".KHHHHHHHWK..",
+        ".KWWWWWWWWKO.",
+        "KHHHHHHHWPKOO",
+        "KYYYYYYYYYKO.",
+        "KYYYYYYYYYK..",
+        ".KYYYYYYYYK..",
+        ".KKYYYYYYK...",
+        "..KKYYYYKK...",
+        "....KKKK....."
+    )
+
+    // Ниндзя: тёмная маска, узкая белая прорезь для глаз (W), красная повязка (O).
+    private val ninjaBody = arrayOf(
+        "....KKKK.....",
+        "..KKKKKKKK...",
+        ".KKKKKKKKKK..",
+        ".KKWWWWWWKKO.",
+        "KKKKKKKKKKKOO",
+        "KYYYYYYYYYKO.",
+        "KYYYYYYYYYK..",
+        ".KYYYYYYYYK..",
+        ".KKYYYYYYK...",
+        "..KKYYYYKK...",
+        "....KKKK....."
+    )
+
+    // Феникс: огненная палитра, маленький хохолок-язычок пламени (O) сверху.
+    private val phoenixBody = arrayOf(
+        "....OKKKK....",
+        "..KKHHHHKK...",
+        ".KHHHYYYYWK..",
+        ".KHYYYYYWPKO.",
+        "KHYYYYYYWPKOO",
+        "KYYYYYYYYYKO.",
+        "KYYYYYYYYYK..",
+        ".KYYYYYYYYK..",
+        ".KKYYYYYYK...",
+        "..KKYYYYKK...",
+        "....KKKK....."
+    )
+
+    // Индекс совпадает с skinPalettes: 0 база, 1 паук, 2 бэтмен, 3 робот, 4 ниндзя, 5 феникс.
+    private val skinBodies = arrayOf(birdBody, spiderBody, batmanBody, robotBody, ninjaBody, phoenixBody)
 
     // ---- Paint ----
     // Общая палитра (облака и т.п.).
@@ -223,6 +341,27 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
             'W' to Color.rgb(236, 240, 255), 'P' to Color.rgb(10, 10, 14),
             'K' to Color.rgb(14, 15, 20), 'O' to Color.rgb(242, 200, 42),
             'G' to Color.rgb(20, 22, 28)
+        ),
+        // 3 — робот: металлический серый корпус, голубой визор, красный индикатор.
+        palette(
+            'Y' to Color.rgb(150, 158, 170), 'H' to Color.rgb(190, 198, 210),
+            'W' to Color.rgb(90, 220, 235), 'P' to Color.rgb(15, 18, 24),
+            'K' to Color.rgb(40, 46, 58), 'O' to Color.rgb(230, 70, 60),
+            'G' to Color.rgb(120, 128, 140)
+        ),
+        // 4 — ниндзя: тёмно-синяя маска, белая прорезь глаз, красная повязка.
+        palette(
+            'Y' to Color.rgb(38, 44, 66), 'H' to Color.rgb(52, 60, 86),
+            'W' to Color.rgb(235, 240, 250), 'P' to Color.rgb(10, 12, 18),
+            'K' to Color.rgb(16, 18, 28), 'O' to Color.rgb(210, 50, 50),
+            'G' to Color.rgb(28, 32, 50)
+        ),
+        // 5 — феникс: огненный оранжево-жёлтый корпус, красное крыло-пламя.
+        palette(
+            'Y' to Color.rgb(240, 120, 30), 'H' to Color.rgb(255, 200, 80),
+            'W' to Color.rgb(255, 255, 255), 'P' to Color.rgb(40, 20, 10),
+            'K' to Color.rgb(120, 30, 20), 'O' to Color.rgb(255, 225, 90),
+            'G' to Color.rgb(220, 60, 30)
         )
     )
 
@@ -252,6 +391,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private val btnPanelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private var btnTextColor = Color.WHITE
 
+    // Панель таблицы Game Over — постоянно серая; текст берёт цвет темы времени суток.
+    private val goPanelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(206, 209, 216) }
+
     // Небо (полосы).
     private var skyBands = intArrayOf()
 
@@ -280,8 +422,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         isFocusable = true
         best = prefs.getInt("best", 0)
         coins = prefs.getInt("coins", 0)
+        progress = Progress(prefs)
+        // Восстанавливаем купленные скины из битовой маски.
         val mask = prefs.getInt("unlocked", 1)
         for (i in unlocked.indices) unlocked[i] = i == 0 || (mask and (1 shl i)) != 0
+        refreshRecordUnlocks()          // скины, открываемые за рекорд, — по текущему best
         skin = prefs.getInt("skin", 0).coerceIn(0, skinPalettes.size - 1)
         if (!unlocked[skin]) skin = 0   // на всякий случай: не даём носить незакрытый скин
         sound.musicVolume = prefs.getFloat("musicVol", 0.6f)
@@ -291,21 +436,35 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         Thread { sound.init() }.start()   // генерация WAV не должна блокировать UI
     }
 
+    /**
+     * Пересчёт всех размеров и настроек механики под текущий экран (w × h).
+     * Все величины заданы как доли ширины/высоты, поэтому игра одинаково
+     * ощущается на разных экранах. Это главные «ручки» баланса — крути их,
+     * чтобы сделать игру легче/сложнее.
+     */
     private fun setupWorld() {
-        groundHeight = h * 0.14f
-        groundY = h - groundHeight
-        gravity = h * 3.4f
-        flapVelocity = -h * 0.92f
-        pipeSpeed = w * 0.55f
-        pipeWidth = w * 0.18f
-        pipeGap = h * 0.30f
-        pipeSpacing = w * 0.62f
-        birdRadius = w * 0.045f
-        birdPixel = birdRadius * 0.185f
-        cloudPixel = w * 0.022f
+        // --- Геометрия земли ---
+        groundHeight = h * 0.14f          // высота полосы «тротуара» снизу (доля высоты экрана)
+        groundY = h - groundHeight        // Y-координата верха земли = «пол», по который падает птица
+
+        // --- Физика птицы (px и px/сек) ---
+        gravity = h * 3.4f                // сила притяжения вниз. Больше → птица падает быстрее, играть сложнее
+        flapVelocity = -h * 0.92f         // импульс вверх по касанию (минус = вверх). Сильнее → выше подскок
+
+        // --- Трубы-препятствия ---
+        pipeSpeed = w * 0.55f             // скорость движения труб влево, px/сек. Больше → быстрее, сложнее
+        pipeWidth = w * 0.18f             // ширина трубы (дома). Больше → уже коридор по горизонтали
+        pipeGap = h * 0.30f               // высота проёма между верхней и нижней трубой. Меньше → сложнее пролететь
+        pipeSpacing = w * 0.62f           // горизонтальный интервал между парами труб. Меньше → трубы чаще
+
+        // --- Размер птицы и пикселей спрайтов ---
+        birdRadius = w * 0.045f           // радиус круга птицы для коллизий и отрисовки
+        birdPixel = birdRadius * 0.185f   // размер одного «пикселя» спрайта птицы (13×11 клеток)
+        cloudPixel = w * 0.022f           // размер «пикселя» облаков на фоне
+        buildStarField()                  // звёзды для ночной темы (детерминированные позиции)
         layoutSettings()
 
-        applyTheme()
+        applyTheme(themeIndex)
         resetGame()
         if (!hasLoaded) {
             state = State.LOADING
@@ -313,32 +472,107 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         }
     }
 
-    /** Дневная палитра города. */
-    private fun applyTheme() {
-        skyBands = intArrayOf(
-            Color.rgb(58, 140, 230), Color.rgb(86, 162, 240),
-            Color.rgb(120, 190, 250), Color.rgb(162, 214, 255)
-        )
-        celestialPaint.color = Color.rgb(255, 231, 120)
-        cityFarPaint.color = Color.rgb(150, 172, 206)
-        cityNearPaint.color = Color.rgb(120, 148, 190)
-        winLitPaint.color = Color.rgb(206, 230, 252)
-        winDarkPaint.color = Color.rgb(96, 124, 164)
-        winThreshold = 0.5f
-        pavementPaint.color = Color.rgb(150, 156, 168)
-        curbPaint.color = Color.rgb(182, 188, 200)
-        tilePaint.color = Color.rgb(122, 128, 140)
-        btnPanelPaint.color = Color.rgb(228, 240, 255)
-        btnTextColor = Color.rgb(40, 54, 92)
-        obsBody.color = Color.rgb(180, 186, 194)   // тело дома-препятствия серое
-        obsEdge.color = Color.rgb(150, 156, 164)   // боковая грань темнее
-        obsRoof.color = Color.rgb(120, 126, 134)   // крыша самая тёмная
-        obsWinLit.color = Color.rgb(224, 228, 234)
-        obsWinDark.color = Color.rgb(138, 144, 152)
-        titleTop = Color.rgb(255, 224, 90)         // жёлто-оранжевый
-        titleBottom = Color.rgb(232, 120, 24)
+    /** Заполняет звёздное поле (пары x,y в долях экрана) для ночной темы. */
+    private fun buildStarField() {
+        val n = 40
+        val arr = FloatArray(n * 2)
+        val rnd = Random(1234)            // фиксированный seed → звёзды не «прыгают» при рестарте
+        for (i in 0 until n) {
+            arr[i * 2] = rnd.nextFloat()
+            arr[i * 2 + 1] = rnd.nextFloat() * 0.6f   // только в верхних 60% экрана
+        }
+        starField = arr
+    }
+
+    /**
+     * Применяет палитру города для темы [t]: 0 — день, 1 — закат, 2 — ночь.
+     * Тема переключается по мере роста счёта (см. update).
+     *
+     * Как редактировать: правьте цвета в нужной ветке when, а порядок/число тем
+     * — через themeCount и логику выбора темы в update().
+     */
+    private fun applyTheme(t: Int) {
+        when (t) {
+            1 -> {   // ---- ЗАКАТ: тёплое оранжево-розовое небо ----
+                skyBands = intArrayOf(
+                    Color.rgb(252, 140, 70), Color.rgb(250, 170, 110),
+                    Color.rgb(248, 196, 150), Color.rgb(250, 220, 180)
+                )
+                celestialPaint.color = Color.rgb(255, 180, 90)      // низкое оранжевое солнце
+                cityFarPaint.color = Color.rgb(170, 130, 140)
+                cityNearPaint.color = Color.rgb(140, 100, 120)
+                winLitPaint.color = Color.rgb(255, 224, 170)
+                winDarkPaint.color = Color.rgb(120, 90, 110)
+                winThreshold = 0.45f
+                pavementPaint.color = Color.rgb(150, 130, 130)
+                curbPaint.color = Color.rgb(180, 158, 150)
+                tilePaint.color = Color.rgb(120, 104, 104)
+                btnPanelPaint.color = Color.rgb(255, 236, 214)
+                btnTextColor = Color.rgb(120, 60, 30)
+                obsBody.color = Color.rgb(190, 150, 140)
+                obsEdge.color = Color.rgb(160, 122, 116)
+                obsRoof.color = Color.rgb(128, 96, 92)
+                obsWinLit.color = Color.rgb(255, 226, 176)
+                obsWinDark.color = Color.rgb(150, 112, 108)
+                titleTop = Color.rgb(255, 224, 90)
+                titleBottom = Color.rgb(232, 100, 40)
+            }
+            2 -> {   // ---- НОЧЬ: тёмно-синее небо, луна, звёзды, снег ----
+                skyBands = intArrayOf(
+                    Color.rgb(18, 24, 60), Color.rgb(28, 36, 82),
+                    Color.rgb(40, 52, 104), Color.rgb(56, 70, 128)
+                )
+                celestialPaint.color = Color.rgb(232, 236, 250)     // бледная луна
+                cityFarPaint.color = Color.rgb(48, 56, 92)
+                cityNearPaint.color = Color.rgb(36, 44, 76)
+                winLitPaint.color = Color.rgb(255, 226, 140)
+                winDarkPaint.color = Color.rgb(30, 38, 66)
+                winThreshold = 0.6f
+                pavementPaint.color = Color.rgb(46, 52, 72)
+                curbPaint.color = Color.rgb(64, 72, 96)
+                tilePaint.color = Color.rgb(34, 40, 58)
+                btnPanelPaint.color = Color.rgb(40, 50, 80)
+                btnTextColor = Color.rgb(220, 228, 250)
+                obsBody.color = Color.rgb(52, 58, 88)
+                obsEdge.color = Color.rgb(40, 46, 72)
+                obsRoof.color = Color.rgb(28, 34, 56)
+                obsWinLit.color = Color.rgb(255, 224, 138)
+                obsWinDark.color = Color.rgb(36, 44, 70)
+                titleTop = Color.rgb(180, 200, 255)
+                titleBottom = Color.rgb(120, 130, 220)
+            }
+            else -> {  // ---- ДЕНЬ (тема 0): голубое небо, солнце ----
+                skyBands = intArrayOf(
+                    Color.rgb(58, 140, 230), Color.rgb(86, 162, 240),
+                    Color.rgb(120, 190, 250), Color.rgb(162, 214, 255)
+                )
+                celestialPaint.color = Color.rgb(255, 231, 120)
+                cityFarPaint.color = Color.rgb(150, 172, 206)
+                cityNearPaint.color = Color.rgb(120, 148, 190)
+                winLitPaint.color = Color.rgb(206, 230, 252)
+                winDarkPaint.color = Color.rgb(96, 124, 164)
+                winThreshold = 0.5f
+                pavementPaint.color = Color.rgb(150, 156, 168)
+                curbPaint.color = Color.rgb(182, 188, 200)
+                tilePaint.color = Color.rgb(122, 128, 140)
+                btnPanelPaint.color = Color.rgb(228, 240, 255)
+                btnTextColor = Color.rgb(40, 54, 92)
+                obsBody.color = Color.rgb(180, 186, 194)   // тело дома-препятствия серое
+                obsEdge.color = Color.rgb(150, 156, 164)   // боковая грань темнее
+                obsRoof.color = Color.rgb(120, 126, 134)   // крыша самая тёмная
+                obsWinLit.color = Color.rgb(224, 228, 234)
+                obsWinDark.color = Color.rgb(138, 144, 152)
+                titleTop = Color.rgb(255, 224, 90)         // жёлто-оранжевый
+                titleBottom = Color.rgb(232, 120, 24)
+            }
+        }
+        // Ночью — это луна (isNight используется в drawSky для звёзд/формы).
+        isNight = t == 2
         textCache.clear()
     }
+
+    /** Ночная тема — рисуем звёзды и луну вместо солнца. */
+    private var isNight = false
 
     /** Геометрия шестерёнки, кнопки магазина и окна настроек (зависит от размеров экрана). */
     private fun layoutSettings() {
@@ -347,18 +581,35 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         // Кнопка магазина — под шестернёй, тот же размер и правый отступ.
         val shopTop = gearBtn.bottom + g * 0.28f
         shopBtn.set(gearBtn.left, shopTop, gearBtn.right, shopTop + g)
+        // Кнопка «цели» (задания/достижения) — под магазином.
+        val trophyTop = shopBtn.bottom + g * 0.28f
+        trophyBtn.set(gearBtn.left, trophyTop, gearBtn.right, trophyTop + g)
 
-        // Экран магазина: стрелка «назад» слева сверху и ряд скинов по центру.
+        // Кнопка паузы во время игры — левый верхний угол (под счётчиком монет).
+        // Кнопка паузы — правый верхний угол (крупнее, на месте шестерёнки).
+        val pb = g * 1.15f
+        pauseBtn.set(w - pb - w * 0.04f, h * 0.03f, w - w * 0.04f, h * 0.03f + pb)
+        // Кнопки в оверлее паузы — по центру, друг под другом.
+        val bw2 = w * 0.5f; val bh2 = h * 0.08f
+        resumeBtn.set((w - bw2) / 2f, h * 0.44f, (w + bw2) / 2f, h * 0.44f + bh2)
+        pauseHomeBtn.set((w - bw2) / 2f, h * 0.56f, (w + bw2) / 2f, h * 0.56f + bh2)
+
+        // Экран магазина: стрелка «назад» слева сверху и сетка скинов 2×3 по центру.
         shopBackBtn.set(w * 0.05f, h * 0.05f, w * 0.05f + g, h * 0.05f + g)
-        val slot = w * 0.22f
-        val gap = w * 0.06f
-        val n = skinSlots.size
-        val rowW = n * slot + (n - 1) * gap
+        trophyBackBtn.set(shopBackBtn)            // тот же угол на экране целей
+        val cols = 3
+        val slot = w * 0.24f
+        val gapX = w * 0.05f
+        val gapY = h * 0.03f
+        val rowW = cols * slot + (cols - 1) * gapX
         val startX = (w - rowW) / 2f
-        val cy = h * 0.46f
+        val startY = h * 0.34f
         for (i in skinSlots.indices) {
-            val l = startX + i * (slot + gap)
-            skinSlots[i].set(l, cy - slot / 2f, l + slot, cy + slot / 2f)
+            val r = i / cols                      // ряд (0 верхний, 1 нижний)
+            val c = i % cols                      // колонка
+            val l = startX + c * (slot + gapX)
+            val t = startY + r * (slot + gapY)
+            skinSlots[i].set(l, t, l + slot, t + slot)
         }
 
         val pw = w * 0.86f
@@ -387,7 +638,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private fun resetGame() {
         bird = Bird(w * 0.28f, groundY / 2f, birdRadius, gravity, flapVelocity)
         pipes.clear()
+        particles.clear()
         score = 0
+        coinsThisRun = 0
+        pipesUntilCoin = Random.nextInt(4, 8)   // до первой монеты — 4..7 труб
+        if (themeIndex != 0) { themeIndex = 0; applyTheme(0) }   // каждая партия стартует с дневной темы
         state = State.READY
     }
 
@@ -397,76 +652,260 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         prefs.edit { putInt("skin", skin) }
     }
 
-    private fun spawnPipe(atX: Float) {
-        val margin = h * 0.12f
-        val minTop = margin
-        val maxTop = groundY - pipeGap - margin
-        val gapTop = Random.nextFloat() * (maxTop - minTop) + minTop
-        pipes.add(Pipe(atX, pipeWidth, gapTop, pipeGap, Random.nextInt()))
+    /** Открывает скины, чей порог рекорда уже достигнут текущим best. */
+    private fun refreshRecordUnlocks() {
+        for (i in unlocked.indices) {
+            if (isRecordSkin(i) && best >= skinRecordReq[i]) unlocked[i] = true
+        }
     }
 
+    /** Сколько скинов открыто (для достижения «все скины»). */
+    private fun skinsOwnedCount(): Int = unlocked.count { it }
+
+    // ---- Растущая сложность ----
+    // Как это работает: со счётом растёт «уровень сложности» diffLevel (0..6),
+    // от него зависят скорость труб и ширина проёма. Три ручки настройки:
+    //   • делитель 18f — КАК БЫСТРО растёт сложность. Больше делитель → медленнее
+    //     (новая ступень примерно раз в столько очков). Меньше → резче.
+    //   • потолок 6f — СКОЛЬКО ступеней максимум (ограничивает предельную сложность).
+    //   • множители 0.06f и 0.03f — НА СКОЛЬКО меняются скорость/проём за ступень.
+    // Пример: 6 ступеней × 0.06 = до +36% к скорости; × 0.03 = до −18% к проёму.
+    private fun diffLevel(): Float = (score / 18f).coerceAtMost(6f)              // текущая ступень сложности 0..6
+    private fun currentSpeed(): Float = pipeSpeed * (1f + diffLevel() * 0.06f)   // трубы едут быстрее с ростом ступени
+    private fun currentGap(): Float = pipeGap * (1f - diffLevel() * 0.03f)       // проём сужается с ростом ступени
+
+    // ---- Частицы (анимации) ----
+    /** Разлетающиеся квадратики из точки (cx, cy): взрыв удара, искры монеты. */
+    private fun burst(cx: Float, cy: Float, count: Int, color: Int, spread: Float, grav: Float, life: Float) {
+        repeat(count) {
+            val ang = Random.nextFloat() * (2f * PI.toFloat())
+            val spd = Random.nextFloat() * spread
+            particles.add(
+                Particle(
+                    cx, cy,
+                    cos(ang) * spd, sin(ang) * spd,
+                    life * (0.6f + Random.nextFloat() * 0.4f),
+                    birdRadius * (0.18f + Random.nextFloat() * 0.18f),
+                    color, grav
+                )
+            )
+        }
+    }
+
+    /**
+     * Короткая вибрация (полировка). Работает при наличии вибромотора.
+     * Длительность [ms] по умолчанию 60 мс — увеличьте для более «тяжёлого» отклика.
+     */
+    private fun vibrate(ms: Long = 60L) {
+        val v = vibrator ?: return
+        if (!v.hasVibrator()) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+        } else {
+            @Suppress("DEPRECATION") v.vibrate(ms)
+        }
+    }
+
+    /** Взмах птицы: звук + пара «пёрышек» позади. Единая точка вызова взмаха. */
+    private fun doFlap() {
+        bird.flap()
+        sound.playFlap()
+        // Пёрышки летят назад-вниз от птицы.
+        repeat(3) {
+            particles.add(
+                Particle(
+                    bird.x - birdRadius * 0.4f, bird.y,
+                    -Random.nextFloat() * w * 0.12f - w * 0.02f,
+                    Random.nextFloat() * h * 0.05f,
+                    0.4f, birdRadius * 0.16f,
+                    skinPalettes[skin]['H']?.color ?: Color.WHITE, h * 0.4f
+                )
+            )
+        }
+    }
+
+    /**
+     * Создаёт новую пару труб у правого края (atX). Высота проёма фиксирована
+     * (pipeGap), а его вертикальное положение выбирается случайно, но с отступом
+     * margin от потолка и от земли — чтобы проём не прижимался к краям.
+     */
+    private fun spawnPipe(atX: Float) {
+        val gap = currentGap()                        // текущая высота проёма (уменьшается со сложностью)
+        val margin = h * 0.12f                        // «мёртвая зона» у верха и низа, куда проём не ставится
+        val minTop = margin                           // самое верхнее положение проёма
+        val maxTop = groundY - gap - margin           // самое нижнее (чтобы проём целиком помещался над землёй)
+        val gapTop = Random.nextFloat() * (maxTop - minTop) + minTop
+        val pipe = Pipe(atX, pipeWidth, gapTop, gap, Random.nextInt())
+        // Монета появляется не на каждой трубе, а раз в несколько труб.
+        // Как редактировать частоту монет: меняйте диапазон Random.nextInt(4, 8)
+        // — это «через сколько труб» появится следующая монета. nextInt(4, 8) даёт
+        // 4..7 (верхняя граница не включается). Хотите чаще — уменьшите числа
+        // (напр. 2, 5 → каждые 2..4 трубы); реже — увеличьте (напр. 6, 11).
+        if (pipesUntilCoin <= 0) {
+            pipe.hasCoin = true
+            pipesUntilCoin = Random.nextInt(4, 8)     // отсчёт до следующей монеты
+        } else {
+            pipesUntilCoin--
+        }
+        pipes.add(pipe)
+    }
+
+    /**
+     * Один шаг игровой логики за dt секунд (вызывается из игрового потока каждый
+     * кадр). Поведение зависит от текущего состояния (state):
+     *  LOADING   — экран загрузки, только едет фон.
+     *  READY     — главное меню, птица «парит» на месте.
+     *  PLAYING   — идёт игра: физика, спавн/движение труб, очки, коллизии.
+     *  GAME_OVER — всё замерло до касания (рестарт).
+     */
     fun update(dt: Float) {
+        if (state == State.PAUSED) return            // на паузе всё замирает
+        updateParticles(dt)                          // эффекты живут во всех остальных состояниях
+        if (achToastTime > 0f) achToastTime -= dt    // таймер плашки достижения
         when (state) {
             State.LOADING -> {
-                scroll += pipeSpeed * 0.2f * dt
+                scroll += pipeSpeed * 0.2f * dt          // фон медленно едет для «живости» экрана загрузки
                 if (System.currentTimeMillis() - loadStart >= loadDuration) {
                     hasLoaded = true
-                    state = State.READY
+                    state = State.READY                  // загрузка закончилась → главное меню
                 }
             }
             State.READY -> {
-                scroll += pipeSpeed * 0.2f * dt
+                scroll += pipeSpeed * 0.2f * dt          // фон едет медленно, как в меню
+                // Птица плавно покачивается вверх-вниз (синус) вокруг центра экрана.
                 bird.y = groundY / 2f + sin(System.currentTimeMillis() / 200.0).toFloat() * (h * 0.01f)
             }
             State.PLAYING -> {
-                bird.update(dt)
-                scroll += pipeSpeed * dt
+                val spd = currentSpeed()                 // скорость растёт со счётом (растущая сложность)
+                bird.update(dt)                          // гравитация + перемещение птицы
+                scroll += spd * dt                       // фон едет со скоростью труб (параллакс от scroll)
+
+                updateTheme()                            // смена времени суток по мере роста счёта
+
+                // Спавн новой пары труб, когда последняя отъехала на pipeSpacing от края.
                 if (pipes.isEmpty() || pipes.last().x < w - pipeSpacing) spawnPipe(w)
+
                 val iter = pipes.iterator()
                 while (iter.hasNext()) {
                     val p = iter.next()
-                    p.update(dt, pipeSpeed)
+                    p.update(dt, spd)                    // двигаем трубу влево
+
+                    // НАЧИСЛЕНИЕ ОЧКА: труба целиком прошла левее птицы и ещё не засчитана.
+                    // Хотите давать больше очков за трубу — измените score++ (напр. score += 2).
+                    // Награды-монеты от заданий прибавляются к coins и сохраняются в prefs.
                     if (!p.passed && p.x + p.width < bird.x) {
                         p.passed = true; score++; sound.playScore()
-                        if (score % 5 == 0) {   // каждые 5 очков — монета
-                            coins++
+                        coins += progress.onPipe()       // задания «пройди N труб» могут начислить монеты
+                        coins += progress.reportScore(score)  // задания «набери N очков»
+                        prefs.edit { putInt("coins", coins) }
+                    }
+
+                    // ПОДБОР МОНЕТЫ в проёме: если круг птицы накрыл монету — забираем.
+                    // coinPickR — радиус подбора (насколько близко надо подлететь); задаётся ниже.
+                    // coins++ — сколько даём за одну монету (поменяйте, чтобы монета стоила больше).
+                    if (p.hasCoin && !p.coinCollected) {
+                        val dx = bird.x - p.coinX; val dy = bird.y - p.coinY
+                        val rr = bird.radius + coinPickR
+                        if (dx * dx + dy * dy <= rr * rr) {
+                            p.coinCollected = true
+                            coins++; coinsThisRun++      // +1 к общим монетам и к монетам за забег
+                            coins += progress.onCoin()   // задания «собери N монет»
                             prefs.edit { putInt("coins", coins) }
+                            sound.playScore()
+                            burst(p.coinX, p.coinY, 10, Color.rgb(255, 214, 92), w * 0.35f, 0f, 0.5f)  // искры подбора
                         }
                     }
-                    if (p.collidesWith(bird.x, bird.y, bird.radius, groundY)) gameOver()
-                    if (p.isOffScreen()) iter.remove()
+
+                    if (p.collidesWith(bird.x, bird.y, bird.radius, groundY)) gameOver()  // врезались в трубу
+                    if (p.isOffScreen()) iter.remove()   // ушедшую за левый край убираем из списка
                 }
+
+                // Столкновение с землёй — конец игры (птицу прижимаем к полу).
                 if (bird.y + bird.radius >= groundY) { bird.y = groundY - bird.radius; gameOver() }
+                // Потолок не убивает, но не даём улететь за верх экрана.
                 if (bird.y - bird.radius < 0f) bird.y = bird.radius
             }
-            State.GAME_OVER -> {}
+            State.PAUSED -> {}                            // всё замерло, ждём «продолжить»
+            State.GAME_OVER -> {}                         // ждём касания; рестарт делает onTouchEvent
         }
     }
 
+    /** Радиус подбора монеты (доля радиуса птицы). */
+    private val coinPickR get() = birdRadius * 0.75f
+
+    /** Обновление и удаление отживших эффект-частиц. */
+    private fun updateParticles(dt: Float) {
+        val it = particles.iterator()
+        while (it.hasNext()) {
+            val p = it.next()
+            p.update(dt)
+            if (p.dead) it.remove()
+        }
+    }
+
+    /**
+     * Смена времени суток по счёту: день → закат → ночь → день → …
+     *
+     * Как редактировать:
+     *   • число 12 — через сколько очков меняется тема. Больше → тема держится
+     *     дольше; меньше → меняется чаще.
+     *   • themeCount — сколько тем в цикле (сами палитры — в applyTheme).
+     * Порядок тем задаётся индексом: 0 день, 1 закат, 2 ночь.
+     */
+    private fun updateTheme() {
+        val target = (score / 12) % themeCount
+        if (target != themeIndex) {
+            themeIndex = target
+            applyTheme(themeIndex)
+        }
+    }
+
+    /** Завершение партии: рекорд, достижения, эффект удара, вибрация. */
     private fun gameOver() {
-        if (state != State.PLAYING) return
+        if (state != State.PLAYING) return   // защита от повторного вызова (труба + земля в одном кадре)
         state = State.GAME_OVER
+        burst(bird.x, bird.y, 18, skinPalettes[skin]['Y']?.color ?: Color.WHITE, w * 0.5f, h * 0.6f, 0.7f)  // брызги удара
+        vibrate()                            // тактильный отклик (длительность по умолчанию)
         if (score > best) {
             best = score
-            prefs.edit { putInt("best", best) }
+            prefs.edit { putInt("best", best) }   // рекорд переживает перезапуск приложения
+            refreshRecordUnlocks()                // возможно, открылся скин за рекорд
         }
+        progress.onGameFinished()
+        val newly = progress.refreshAchievements(best, skinsOwnedCount())
+        if (newly.isNotEmpty()) { achToast = newly.first(); achToastTime = 3.5f }  // покажем плашку
     }
 
+    /**
+     * Главный обработчик ввода. Одно касание (тап) — универсальное действие,
+     * смысл которого зависит от состояния игры:
+     *   READY     — тап по кнопке открывает магазин/настройки, иначе начинает игру.
+     *   PLAYING   — «взмах»: толчок птицы вверх.
+     *   GAME_OVER — рестарт.
+     * ACTION_MOVE/UP используются только для перетаскивания ползунков громкости.
+     */
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val x = event.x; val y = event.y
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 synchronized(lock) {
                     when (state) {
-                        State.LOADING -> {}
+                        State.LOADING -> {}                              // во время загрузки касания игнорируем
                         State.READY ->
-                            if (shopOpen) shopDown(x, y)
-                            else if (settingsOpen) settingsDown(x, y)
-                            else if (gearBtn.contains(x, y)) settingsOpen = true
-                            else if (shopBtn.contains(x, y)) shopOpen = true
-                            else { state = State.PLAYING; bird.reset(bird.y); bird.flap() }
-                        State.PLAYING -> bird.flap()
-                        State.GAME_OVER -> resetGame()
+                            if (shopOpen) shopDown(x, y)                 // открыт магазин → его обработчик
+                            else if (trophyOpen) trophyDown(x, y)        // открыт экран целей → его обработчик
+                            else if (settingsOpen) settingsDown(x, y)    // открыты настройки → их обработчик
+                            else if (gearBtn.contains(x, y)) settingsOpen = true   // тап по шестерёнке
+                            else if (shopBtn.contains(x, y)) shopOpen = true       // тап по кнопке магазина
+                            else if (trophyBtn.contains(x, y)) trophyOpen = true   // тап по кнопке целей
+                            else { state = State.PLAYING; bird.reset(bird.y); doFlap() }  // старт игры + первый взмах
+                        State.PLAYING ->
+                            if (pauseBtn.contains(x, y)) state = State.PAUSED   // тап по паузе
+                            else doFlap()                                // взмах вверх (звук + пёрышки)
+                        State.PAUSED ->
+                            if (resumeBtn.contains(x, y)) state = State.PLAYING       // продолжить
+                            else if (pauseHomeBtn.contains(x, y)) resetGame()         // выйти в меню
+                        State.GAME_OVER -> resetGame()                   // тап после проигрыша → новая попытка
                     }
                 }
                 performClick()
@@ -513,7 +952,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     fun onBackPressed(): Boolean = synchronized(lock) {
         when {
             shopOpen -> { shopOpen = false; true }
+            trophyOpen -> { trophyOpen = false; true }
             settingsOpen -> { settingsOpen = false; activeSlider = 0; true }
+            state == State.PAUSED -> { state = State.PLAYING; true }   // «назад» из паузы — продолжить
             else -> false
         }
     }
@@ -526,10 +967,21 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         }
     }
 
-    /** Тап по иконке скина: если открыт — надеть, иначе купить (при хватке монет). */
+    /** Обработка нажатия на экране целей: только кнопка «назад». */
+    private fun trophyDown(x: Float, y: Float) {
+        if (trophyBackBtn.contains(x, y)) trophyOpen = false
+    }
+
+    /**
+     * Тап по иконке скина:
+     *  - открытый скин — просто надеваем;
+     *  - скин за рекорд (isRecordSkin) — купить нельзя, открывается сам по рекорду;
+     *  - покупной скин — покупаем, если хватает монет, и сразу надеваем.
+     */
     private fun tapSkin(index: Int) {
         if (index !in unlocked.indices) return
         if (unlocked[index]) { selectSkin(index); return }
+        if (isRecordSkin(index)) return                  // такой скин открывается только рекордом
         if (coins >= skinPrices[index]) {
             coins -= skinPrices[index]
             unlocked[index] = true
@@ -562,8 +1014,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     // ---- Рендеринг ----
     fun render(canvas: Canvas) {
         if (w == 0f) return
-        // Магазин — отдельный полноэкранный экран поверх игры.
+        // Полноэкранные экраны поверх игры (магазин / цели).
         if (shopOpen && state == State.READY) { drawShop(canvas); return }
+        if (trophyOpen && state == State.READY) { drawTrophy(canvas); return }
         drawSky(canvas)
         drawClouds(canvas)
         drawCity(canvas, cityFarPaint, w * 0.26f, 0.30f, 0.22f, 0.25f)
@@ -571,8 +1024,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         if (state != State.LOADING) for (p in pipes) drawPipe(canvas, p)
         drawGround(canvas)
         if (state != State.LOADING) drawBird(canvas)
+        drawParticles(canvas)                            // эффект-частицы
         if (state == State.LOADING) drawLoading(canvas) else { drawHud(canvas); drawCoinHud(canvas) }
+        if (state == State.PLAYING) drawPauseButton(canvas)
+        if (state == State.PAUSED) drawPauseOverlay(canvas)
         if (settingsOpen && state == State.READY) drawSettings(canvas)
+        if (achToastTime > 0f) drawAchToast(canvas)      // плашка нового достижения
     }
 
     private fun drawSky(canvas: Canvas) {
@@ -582,16 +1039,52 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
             bandPaint.color = skyBands[i]
             canvas.drawRect(0f, i * bandH, w, (i + 1) * bandH + 1f, bandPaint)
         }
-        // Солнце слева сверху.
+        if (isNight) drawStars(canvas)                   // ночью — звёздное поле
+        // Небесное светило слева сверху: днём/на закате — солнце, ночью — луна.
         val s = w * 0.10f
         val sx = w * 0.10f; val sy = h * 0.10f
         canvas.drawRect(sx, sy, sx + s, sy + s, celestialPaint)
         val c = s * 0.22f
-        canvas.drawRect(sx - c, sy + c, sx, sy + s - c, celestialPaint)
-        canvas.drawRect(sx + s, sy + c, sx + s + c, sy + s - c, celestialPaint)
-        canvas.drawRect(sx + c, sy - c, sx + s - c, sy, celestialPaint)
-        canvas.drawRect(sx + c, sy + s, sx + s - c, sy + s + c, celestialPaint)
+        if (isNight) {
+            // Луна: «откусываем» уголок цветом неба, чтобы получился полумесяц.
+            bandPaint.color = skyBands[0]
+            canvas.drawRect(sx + s * 0.45f, sy - c, sx + s + c, sy + s * 0.55f, bandPaint)
+        } else {
+            // Лучи солнца по четырём сторонам.
+            canvas.drawRect(sx - c, sy + c, sx, sy + s - c, celestialPaint)
+            canvas.drawRect(sx + s, sy + c, sx + s + c, sy + s - c, celestialPaint)
+            canvas.drawRect(sx + c, sy - c, sx + s - c, sy, celestialPaint)
+            canvas.drawRect(sx + c, sy + s, sx + s - c, sy + s + c, celestialPaint)
+        }
     }
+
+    /** Звёзды ночной темы: мерцают по синусу со своей фазой. */
+    private fun drawStars(canvas: Canvas) {
+        val t = System.currentTimeMillis() / 400.0
+        var i = 0
+        while (i < starField.size) {
+            val sx = starField[i] * w
+            val sy = starField[i + 1] * groundY
+            val tw = 0.6f + 0.4f * sin(t + i).toFloat()   // пульсация размера
+            val r = w * 0.006f * tw
+            canvas.drawRect(sx - r, sy - r, sx + r, sy + r, celestialPaint)
+            i += 2
+        }
+    }
+
+    /** Отрисовка эффект-частиц (квадратики), гаснут по мере жизни. */
+    private fun drawParticles(canvas: Canvas) {
+        for (p in particles) {
+            fxPaint.color = p.color
+            fxPaint.alpha = (255 * p.fade).toInt().coerceIn(0, 255)
+            val s = p.size * (0.4f + 0.6f * p.fade)
+            canvas.drawRect(p.x - s, p.y - s, p.x + s, p.y + s, fxPaint)
+        }
+        fxPaint.alpha = 255
+    }
+
+    // Общий Paint для частиц (без сглаживания — пиксельный стиль).
+    private val fxPaint = Paint()
 
     private fun drawClouds(canvas: Canvas) {
         val slot = w * 0.6f
@@ -641,6 +1134,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         drawTower(canvas, p, p.x, 0f, p.x + p.width, p.gapTop, capOver, capH, roofAtBottom = true)
         // Нижний дом стоит на земле (карниз у проёма сверху).
         drawTower(canvas, p, p.x, p.gapBottom, p.x + p.width, groundY, capOver, capH, roofAtBottom = false)
+        // Собираемая монета в центре проёма (если есть и не подобрана), слегка покачивается.
+        if (p.hasCoin && !p.coinCollected) {
+            val bob = sin(System.currentTimeMillis() / 220.0 + p.seed).toFloat() * h * 0.008f
+            drawCoin(canvas, p.coinX, p.coinY + bob, birdRadius * 0.6f)
+        }
     }
 
     private fun drawTower(
@@ -751,17 +1249,53 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
                 if (best > 0) centeredText(canvas, "Рекорд: $best", w / 2f, h * 0.67f, w * 0.05f)
                 drawGear(canvas)
                 drawShopButton(canvas)
+                drawTrophyButton(canvas)
             }
             State.PLAYING -> centeredText(canvas, "$score", w / 2f, h * 0.16f, w * 0.14f)
-            State.GAME_OVER -> {
-                centeredText(canvas, "$score", w / 2f, h * 0.14f, w * 0.1f)
-                pixelTitle(canvas, "GAME", w / 2f, h * 0.34f, w * 0.14f)
-                pixelTitle(canvas, "OVER", w / 2f, h * 0.34f + w * 0.14f * 1.2f, w * 0.14f)
-                centeredText(canvas, "Рекорд: $best", w / 2f, h * 0.60f, w * 0.055f)
-                centeredText(canvas, "Тап — заново", w / 2f, h * 0.67f, w * 0.055f)
-            }
+            State.PAUSED -> centeredText(canvas, "$score", w / 2f, h * 0.16f, w * 0.14f)
+            State.GAME_OVER -> drawGameOver(canvas)
             else -> {}
         }
+    }
+
+    /**
+     * Экран Game Over: заголовок + панель-таблица с медалью, счётом, рекордом и
+     * монетами за забег. Значения и медаль обновляются в gameOver().
+     */
+    private fun drawGameOver(canvas: Canvas) {
+        pixelTitle(canvas, "GAME", w / 2f, h * 0.16f, w * 0.13f)
+        pixelTitle(canvas, "OVER", w / 2f, h * 0.16f + w * 0.13f * 1.2f, w * 0.13f)
+
+        // Панель-таблица результатов: серый фон, три ровные строки «подпись — значение».
+        val pw = w * 0.72f
+        val ph = h * 0.30f
+        val pl = (w - pw) / 2f
+        val pt = h * 0.40f
+        val rad = ph * 0.08f
+        canvas.drawRoundRect(RectF(pl, pt, pl + pw, pt + ph), rad, rad, goPanelPaint)
+
+        // Цвет текста — под текущую тему времени суток (день/закат/ночь).
+        val txt = btnTextColor
+        val labelX = pl + pw * 0.10f            // левая колонка (подписи, выравнивание по левому краю)
+        val valueX = pl + pw * 0.72f            // правая колонка (значения отодвинуты правее)
+        val labelSize = ph * 0.14f
+        val y1 = pt + ph * 0.27f                // Счёт
+        val y2 = pt + ph * 0.53f                // Рекорд
+        val y3 = pt + ph * 0.79f                // Монеты за забег
+
+        leftText(canvas, "Счёт", labelX, y1, labelSize, txt)
+        leftText(canvas, "$score", valueX, y1, labelSize, txt)
+        leftText(canvas, "Рекорд", labelX, y2, labelSize, txt)
+        leftText(canvas, "$best", valueX, y2, labelSize, txt)
+        leftText(canvas, "Монеты", labelX, y3, labelSize, txt)
+        // Значение монет отодвинуто правее остальных: иконка на линии valueX, число — за ней.
+        // Чтобы придвинуть/отодвинуть, меняйте множители при coinR ниже.
+        val coinR = ph * 0.06f
+        drawCoin(canvas, valueX + coinR, y3, coinR)
+        leftText(canvas, "$coinsThisRun", valueX + coinR * 2.6f, y3, labelSize, txt)
+
+        if (score >= best && score > 0) centeredText(canvas, "Новый рекорд!", w / 2f, pt - h * 0.03f, w * 0.05f)
+        centeredText(canvas, "Тап — заново", w / 2f, pt + ph + h * 0.05f, w * 0.05f)
     }
 
     /** Кнопка настроек: серый скруглённый квадрат-фон + чёрная пиксельная шестерёнка. */
@@ -804,19 +1338,19 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         canvas.drawRect(cx - s * 0.25f, cy - s * 0.05f, cx + s * 0.25f, cy + s, shopBgPaint)
     }
 
-    /** Экран магазина: жёлтый фон, стрелка «назад», счётчик монет, ряд скинов. */
+    /** Экран магазина: жёлтый фон, стрелка «назад», счётчик монет, сетка скинов. */
     private fun drawShop(canvas: Canvas) {
         canvas.drawRect(0f, 0f, w, h, shopScreenPaint)
         drawBackArrow(canvas)
         drawShopCoins(canvas)
+        centeredText(canvas, "СКИНЫ", w / 2f, h * 0.22f, w * 0.08f, Color.rgb(70, 45, 0))
 
-        // Оранжевые полоски сверху и снизу ряда скинов.
-        val row = skinSlots[0]
-        val left = w * 0.08f
-        val right = w - w * 0.08f
-        val barH = h * 0.010f
-        canvas.drawRect(left, row.top - h * 0.05f, right, row.top - h * 0.05f + barH, stripePaint)
-        canvas.drawRect(left, row.bottom + h * 0.05f, right, row.bottom + h * 0.05f + barH, stripePaint)
+        // Оранжевые полоски сверху первого ряда и снизу последнего.
+        val left = w * 0.06f
+        val right = w - w * 0.06f
+        val barH = h * 0.008f
+        canvas.drawRect(left, skinSlots.first().top - h * 0.03f, right, skinSlots.first().top - h * 0.03f + barH, stripePaint)
+        canvas.drawRect(left, skinSlots.last().bottom + h * 0.03f, right, skinSlots.last().bottom + h * 0.03f + barH, stripePaint)
 
         for (i in skinSlots.indices) {
             val slot = skinSlots[i]
@@ -832,20 +1366,37 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         }
     }
 
-    /** Затемнение поверх закрытого скина + его цена (монета + число) по центру. */
+    /**
+     * Затемнение поверх закрытого скина + условие открытия по центру:
+     *  - покупной скин — монета + цена;
+     *  - скин за рекорд — «★ N» (нужный рекорд).
+     */
     private fun drawLockedOverlay(canvas: Canvas, index: Int, slot: RectF, r: Float) {
         canvas.drawRoundRect(slot, r, r, lockDimPaint)
-        val priceTxt = "${skinPrices[index]}"
-        val ps = slot.height() * 0.22f
-        uiTextPaint.textSize = ps
-        val tw = uiTextPaint.measureText(priceTxt)
-        val cr = ps * 0.55f
-        val gap = ps * 0.25f
-        val total = cr * 2f + gap + tw
-        val startX = slot.centerX() - total / 2f
+        val ps = slot.height() * 0.20f
         val cy = slot.centerY()
-        drawCoin(canvas, startX + cr, cy, cr)
-        leftText(canvas, priceTxt, startX + cr * 2f + gap, cy, ps, textWhite)
+        if (isRecordSkin(index)) {
+            // Требуется рекорд: звезда + число.
+            val txt = "${skinRecordReq[index]}"
+            uiTextPaint.textSize = ps
+            val tw = uiTextPaint.measureText(txt)
+            val star = ps * 0.6f
+            val total = star + ps * 0.3f + tw
+            val startX = slot.centerX() - total / 2f
+            drawStar(canvas, startX + star / 2f, cy, star, Color.rgb(255, 214, 92))
+            leftText(canvas, txt, startX + star + ps * 0.3f, cy, ps, textWhite)
+        } else {
+            // Покупной: монета + цена.
+            val priceTxt = "${skinPrices[index]}"
+            uiTextPaint.textSize = ps
+            val tw = uiTextPaint.measureText(priceTxt)
+            val cr = ps * 0.55f
+            val gap = ps * 0.25f
+            val total = cr * 2f + gap + tw
+            val startX = slot.centerX() - total / 2f
+            drawCoin(canvas, startX + cr, cy, cr)
+            leftText(canvas, priceTxt, startX + cr * 2f + gap, cy, ps, textWhite)
+        }
     }
 
     /** Счётчик монет в магазине: справа сверху, на уровне стрелки «назад». */
@@ -905,6 +1456,133 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         val oy = slot.centerY() - rows * p / 2f
         drawSprite(canvas, body, ox, oy, p, palette)
         drawSprite(canvas, wingMid, ox + wingCol * p, oy + wingRow * p, p, palette)
+    }
+
+    // ---- Кнопка и экран целей (задания + достижения) ----
+
+    /** Кнопка целей на главном меню: зелёный квадрат + белая звезда. */
+    private fun drawTrophyButton(canvas: Canvas) {
+        val b = trophyBtn
+        val bgR = b.width() * 0.22f
+        canvas.drawRoundRect(b, bgR, bgR, trophyBgPaint)
+        drawStar(canvas, b.centerX(), b.centerY(), b.width() * 0.5f, Color.WHITE)
+    }
+
+    /**
+     * Экран целей: сверху — ежедневные задания с прогресс-барами, снизу —
+     * достижения (галочка/замок). Данные берутся из [progress].
+     */
+    private fun drawTrophy(canvas: Canvas) {
+        canvas.drawRect(0f, 0f, w, h, trophyScreenPaint)
+        // Стрелка «назад» (та же геометрия, что в магазине).
+        run {
+            val bb = trophyBackBtn
+            val cx = bb.centerX(); val cy = bb.centerY()
+            val s = bb.width() * 0.30f
+            val head = Path().apply { moveTo(cx - s, cy); lineTo(cx, cy - s); lineTo(cx, cy + s); close() }
+            canvas.drawPath(head, shopInk)
+            canvas.drawRect(cx - s * 0.2f, cy - s * 0.28f, cx + s, cy + s * 0.28f, shopInk)
+        }
+
+        centeredText(canvas, "ЗАДАНИЯ ДНЯ", w / 2f, h * 0.13f, w * 0.06f)
+        val quests = progress.quests
+        var qy = h * 0.20f
+        for (q in quests) {
+            leftText(canvas, q.title, w * 0.08f, qy, w * 0.044f)
+            // Прогресс p/target и награда (монета + число) справа в строке заголовка.
+            leftText(canvas, "${q.progress.coerceAtMost(q.target)}/${q.target}", w * 0.58f, qy, w * 0.044f)
+            val cr = w * 0.022f
+            drawCoin(canvas, w * 0.80f, qy, cr)
+            leftText(canvas, "+${q.reward}", w * 0.80f + cr * 1.4f, qy, w * 0.044f,
+                if (q.done) Color.rgb(255, 214, 92) else textWhite)
+            // Прогресс-бар.
+            val bx = w * 0.08f; val bw = w * 0.84f; val by = qy + h * 0.02f; val bh = h * 0.012f
+            canvas.drawRoundRect(RectF(bx, by, bx + bw, by + bh), bh / 2f, bh / 2f, barBgPaint)
+            val frac = (q.progress.toFloat() / q.target).coerceIn(0f, 1f)
+            if (frac > 0f) canvas.drawRoundRect(RectF(bx, by, bx + bw * frac, by + bh), bh / 2f, bh / 2f,
+                if (q.done) trophyBgPaint else barFillPaint)
+            qy += h * 0.09f
+        }
+
+        centeredText(canvas, "ДОСТИЖЕНИЯ", w / 2f, h * 0.50f, w * 0.06f)
+        // Достижения — сетка 2 колонки.
+        val achs = progress.achievements
+        val col2 = 2
+        val cellW = w * 0.44f
+        val startX = w * 0.06f
+        var ax = startX; var ay = h * 0.55f
+        for ((i, a) in achs.withIndex()) {
+            val cx = ax + h * 0.02f
+            // Значок: звезда (открыто) или тёмный кружок (закрыто).
+            if (a.unlocked) drawStar(canvas, cx, ay, w * 0.05f, Color.rgb(255, 214, 92))
+            else canvas.drawCircle(cx, ay, w * 0.022f, lockDimPaint)
+            leftText(canvas, a.title, cx + w * 0.05f, ay,
+                w * 0.036f, if (a.unlocked) textWhite else Color.rgb(180, 190, 210))
+            if (i % col2 == col2 - 1) { ax = startX; ay += h * 0.075f } else ax += cellW
+        }
+    }
+
+    // ---- Звезда ----
+
+    /** Пятиконечная звезда с центром (cx, cy) и «размахом» size. */
+    private fun drawStar(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        val outer = size / 2f
+        val inner = outer * 0.42f
+        val path = Path()
+        for (k in 0 until 10) {
+            val rr = if (k % 2 == 0) outer else inner
+            val ang = (-PI / 2 + k * PI / 5).toFloat()
+            val px2 = cx + cos(ang) * rr
+            val py2 = cy + sin(ang) * rr
+            if (k == 0) path.moveTo(px2, py2) else path.lineTo(px2, py2)
+        }
+        path.close()
+        starPaint.color = color
+        canvas.drawPath(path, starPaint)
+    }
+
+    // ---- Пауза ----
+
+    /** Кнопка паузы во время игры: две вертикальные полоски. */
+    private fun drawPauseButton(canvas: Canvas) {
+        val b = pauseBtn
+        val bgR = b.width() * 0.2f
+        canvas.drawRoundRect(b, bgR, bgR, gearBgPaint)
+        val bw = b.width() * 0.14f
+        val cy0 = b.top + b.height() * 0.28f
+        val cy1 = b.bottom - b.height() * 0.28f
+        val x1 = b.centerX() - b.width() * 0.16f
+        val x2 = b.centerX() + b.width() * 0.16f
+        canvas.drawRect(x1 - bw / 2f, cy0, x1 + bw / 2f, cy1, gearInk)
+        canvas.drawRect(x2 - bw / 2f, cy0, x2 + bw / 2f, cy1, gearInk)
+    }
+
+    /** Оверлей паузы: затемнение + «ПАУЗА» + кнопки «Продолжить» и «В меню». */
+    private fun drawPauseOverlay(canvas: Canvas) {
+        canvas.drawRect(0f, 0f, w, h, dimPaint)
+        pixelTitle(canvas, "ПАУЗА", w / 2f, h * 0.28f, w * 0.12f)
+        drawTextButton(canvas, resumeBtn, "Продолжить")
+        drawTextButton(canvas, pauseHomeBtn, "В меню")
+    }
+
+    /** Скруглённая кнопка с центрированной подписью (для оверлея паузы). */
+    private fun drawTextButton(canvas: Canvas, b: RectF, text: String) {
+        val r = b.height() * 0.28f
+        canvas.drawRoundRect(b, r, r, btnPanelPaint)
+        centeredText(canvas, text, b.centerX(), b.centerY(), b.height() * 0.42f, btnTextColor)
+    }
+
+    /** Всплывающая плашка нового достижения (гаснет по таймеру achToastTime). */
+    private fun drawAchToast(canvas: Canvas) {
+        val t = achToast ?: return
+        val alpha = (achToastTime / 3.5f).coerceIn(0f, 1f)
+        val bw = w * 0.7f; val bh = h * 0.07f
+        val b = RectF((w - bw) / 2f, h * 0.06f, (w + bw) / 2f, h * 0.06f + bh)
+        toastPaint.alpha = (220 * alpha).toInt()
+        val r = bh * 0.3f
+        canvas.drawRoundRect(b, r, r, toastPaint)
+        drawStar(canvas, b.left + bh * 0.6f, b.centerY(), bh * 0.6f, Color.rgb(255, 214, 92))
+        leftText(canvas, "Достижение: $t", b.left + bh, b.centerY(), bh * 0.34f, textWhite)
     }
 
     private fun drawSettings(canvas: Canvas) {
