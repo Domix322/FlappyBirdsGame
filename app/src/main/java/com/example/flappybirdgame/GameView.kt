@@ -6,22 +6,26 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.core.content.edit
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.withSave
 import kotlin.math.floor
 import kotlin.math.sin
 import kotlin.random.Random
 
 /**
- * Ядро игры: SurfaceView + игровой поток. Локация — город, две темы (день/ночь),
- * переключаются кнопкой «Theme» в главном меню. Вся графика пиксельная.
+ * Ядро игры: SurfaceView + игровой поток. Локация — дневной город. Вся графика
+ * пиксельная. В главном меню есть кнопка настроек (звук) и кнопка магазина скинов.
  *
- * Технический агент — состояние, физика, коллизии, ввод, рекорд, темы, цикл.
- * Визуальный агент — методы draw*, спрайты, палитра тем, экран загрузки.
+ * Технический агент — состояние, физика, коллизии, ввод, рекорд, скины, цикл.
+ * Визуальный агент — методы draw*, спрайты, палитры скинов, магазин, экран загрузки.
  */
 class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback {
 
@@ -51,7 +55,19 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
 
     private var score = 0
     private var best = 0
-    private var nightMode = false
+
+    /** Выбранный скин птицы: 0 — базовая, 1 — человек-паук, 2 — бэтмен. */
+    private var skin = 0
+
+    // ---- Монеты и покупка скинов ----
+    private var coins = 0
+    /** Стоимость скинов в монетах (индекс = скин). Базовый бесплатный. */
+    private val skinPrices = intArrayOf(0, 10, 20)
+    /** Открыт ли скин (куплен). Базовый открыт всегда. */
+    private val unlocked = booleanArrayOf(true, false, false)
+
+    /** Единый замок для синхронизации игрового потока и обработчика касаний. */
+    private val lock = Any()
 
     private var loadStart = 0L
     private val loadDuration = 2400L
@@ -72,12 +88,14 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private val soundTrack = RectF()
     private val musicMuteBtn = RectF()
     private val soundMuteBtn = RectF()
-    private val settingsThemeBtn = RectF()
 
-    // Кнопка смены темы (теперь живёт внутри окна настроек).
-    private val themeBtn = RectF()
+    // ---- Магазин скинов ----
+    private var shopOpen = false
+    private val shopBtn = RectF()                // кнопка магазина на главном меню (под шестернёй)
+    private val shopBackBtn = RectF()            // стрелка «назад» в магазине
+    private val skinSlots = Array(3) { RectF() } // ряд иконок-скинов в магазине
 
-    // Палитра шестерёнки/контролов (серые, вне тем).
+    // Палитра шестерёнки/контролов (серые).
     private val gearBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(150, 152, 158) }
     private val gearInk = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(20, 20, 22) }
     private val dimPaint = Paint().apply { color = Color.argb(150, 0, 0, 0) }
@@ -87,6 +105,27 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private val slashPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(250, 250, 250); style = Paint.Style.STROKE
     }
+
+    // Палитра магазина: кнопка/экран жёлтые, иконка/стрелка — белые.
+    private val shopBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(255, 200, 40) }
+    private val shopInk = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(255, 255, 255) }
+    private val shopScreenPaint = Paint().apply { color = Color.rgb(255, 200, 40) }
+    private val skinSlotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(255, 214, 92) }
+    private val skinSelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(255, 255, 255); style = Paint.Style.STROKE
+    }
+    // Оранжевые полоски, обрамляющие ряд скинов в магазине.
+    private val stripePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(255, 150, 20) }
+    // Затемнение поверх закрытого (не купленного) скина.
+    private val lockDimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(150, 0, 0, 0) }
+
+    // Монета: золотой кружок с ободком, внутренним кольцом и бликом.
+    private val coinRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(190, 140, 20) }
+    private val coinFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(255, 206, 55) }
+    private val coinEdgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(210, 158, 28); style = Paint.Style.STROKE
+    }
+    private val coinShinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(255, 242, 190) }
 
     // ---- Спрайты ----
     private val birdBody = arrayOf(
@@ -108,47 +147,87 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private val wingCol = 2
     private val wingRow = 4
 
-    // Ночная тёмная птица: тот же силуэт, что днём, но перекрашенный; глаз и клюв
-    // смотрят вперёд (вправо), как у дневной версии.
-    private val batBody = arrayOf(
-        "....BBBB.....",
-        "..BBMMMMBB...",
-        ".BMMMDDDDWB..",
-        ".BMDDDDDWPBM.",
-        "BMDDDDDDWPBMM",
-        "BDDDDDDDDDBM.",
-        "BDDDDDDDDDB..",
-        ".BDDDDDDDDB..",
-        ".BBDDDDDDB...",
-        "..BBDDDDBB...",
-        "....BBBB....."
-    )
-    private val batWingUp = arrayOf("..BBB.", ".BBBB.", "BBBB..", "......")
-    private val batWingMid = arrayOf("......", ".BBBB.", "BBBBBB", "......")
-    private val batWingDown = arrayOf("......", "......", "BBB...", ".BBBBB")
-
     private val cloud = arrayOf("..wwww..", ".wwwwww.", "wwwwwwww", ".cccccc.")
 
+    // Скины-тела: тот же силуэт и размер (13×11), что у базовой птицы, но с
+    // характерными деталями. Цвета символов берутся из палитры скина.
+    // Человек-паук: маска с крупным белым глазом и диагональные нити паутины (K).
+    private val spiderBody = arrayOf(
+        "....KKKK.....",
+        "..KKHHHHKK...",
+        ".KHYKYYWWPK..",
+        ".KYKYYYWWPKO.",
+        "KHYYKYYWWPKOO",
+        "KYKYYKYYYYKO.",
+        "KYYKYYKYYYK..",
+        ".KYYKYYKYYK..",
+        ".KKYYKYYKK...",
+        "..KKYYYYKK...",
+        "....KKKK....."
+    )
+
+    // Бэтмен: вид сбоку, смотрит вправо (как базовая птица) — один белый глаз.
+    // Остроконечные «уши» сверху, жёлтая эмблема на груди, клюв — жёлтый акцент.
+    private val batmanBody = arrayOf(
+        "....K..K.....",
+        "..KKHHHHKK...",
+        ".KHHHYYYYWK..",
+        ".KHYYYYYWPKO.",
+        "KHYYYYYYWPKOO",
+        "KYYYYYYYYYKO.",
+        "KYYYOOOYYYK..",
+        ".KYYYOYYYYK..",
+        ".KKYYYYYYK...",
+        "..KKYYYYKK...",
+        "....KKKK....."
+    )
+
+    // Индекс совпадает с skinPalettes: 0 — базовая, 1 — человек-паук, 2 — бэтмен.
+    private val skinBodies = arrayOf(birdBody, spiderBody, batmanBody)
+
     // ---- Paint ----
+    // Общая палитра (облака и т.п.).
     private val px = HashMap<Char, Paint>().apply {
-        put('Y', Paint().apply { color = Color.rgb(255, 205, 45) })
-        put('H', Paint().apply { color = Color.rgb(255, 233, 130) })
-        put('W', Paint().apply { color = Color.rgb(255, 255, 255) })
-        put('P', Paint().apply { color = Color.rgb(35, 30, 35) })
-        put('K', Paint().apply { color = Color.rgb(70, 45, 25) })
-        put('O', Paint().apply { color = Color.rgb(255, 150, 30) })
-        put('G', Paint().apply { color = Color.rgb(235, 160, 35) })
         put('w', Paint().apply { color = Color.rgb(248, 252, 255) })
         put('c', Paint().apply { color = Color.rgb(210, 230, 248) })
-        put('B', Paint().apply { color = Color.rgb(22, 24, 30) })    // тёмная птица: чёрный контур/крыло
-        put('D', Paint().apply { color = Color.rgb(84, 90, 108) })   // тёмная птица: корпус
-        put('M', Paint().apply { color = Color.rgb(120, 126, 144) }) // тёмная птица: светлый блик/клюв
     }
+
+    /**
+     * Палитры скинов. Силуэт птицы у всех одинаковый (birdBody/wing*), меняются
+     * только цвета символов: K — контур, H — светлый корпус, Y — корпус, W — глаз,
+     * P — зрачок, O — клюв/акцент, G — крыло.
+     */
+    private fun palette(vararg pairs: Pair<Char, Int>) = HashMap<Char, Paint>().apply {
+        for ((ch, col) in pairs) put(ch, Paint().apply { color = col })
+    }
+
+    private val skinPalettes = arrayOf(
+        // 0 — базовая жёлтая птица.
+        palette(
+            'Y' to Color.rgb(255, 205, 45), 'H' to Color.rgb(255, 233, 130),
+            'W' to Color.rgb(255, 255, 255), 'P' to Color.rgb(35, 30, 35),
+            'K' to Color.rgb(70, 45, 25), 'O' to Color.rgb(255, 150, 30),
+            'G' to Color.rgb(235, 160, 35)
+        ),
+        // 1 — человек-паук: красный корпус, чёрные нити паутины/контур, белый
+        // глаз, синее крыло; клюв под цвет корпуса.
+        palette(
+            'Y' to Color.rgb(206, 38, 38), 'H' to Color.rgb(232, 74, 74),
+            'W' to Color.rgb(245, 245, 250), 'P' to Color.rgb(12, 12, 16),
+            'K' to Color.rgb(24, 22, 30), 'O' to Color.rgb(198, 34, 34),
+            'G' to Color.rgb(40, 78, 200)
+        ),
+        // 2 — бэтмен: тёмно-серый корпус, чёрный «плащ»-крыло, жёлтый акцент.
+        palette(
+            'Y' to Color.rgb(60, 64, 74), 'H' to Color.rgb(92, 98, 112),
+            'W' to Color.rgb(236, 240, 255), 'P' to Color.rgb(10, 10, 14),
+            'K' to Color.rgb(14, 15, 20), 'O' to Color.rgb(242, 200, 42),
+            'G' to Color.rgb(20, 22, 28)
+        )
+    )
 
     private val bandPaint = Paint()
     private val celestialPaint = Paint()
-    private val celestialShadePaint = Paint()
-    private val starPaint = Paint().apply { color = Color.rgb(255, 255, 225) }
 
     private val cityFarPaint = Paint()
     private val cityNearPaint = Paint()
@@ -173,7 +252,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private val btnPanelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private var btnTextColor = Color.WHITE
 
-    // Небо (полосы) по темам.
+    // Небо (полосы).
     private var skyBands = intArrayOf()
 
     // Цвета текста (градиент заголовка зависит от темы).
@@ -196,18 +275,15 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
     }
 
-    // Звёзды (ночь) — фиксированные, без мерцания.
-    private val starPts = arrayOf(
-        floatArrayOf(0.14f, 0.12f), floatArrayOf(0.30f, 0.08f), floatArrayOf(0.44f, 0.16f),
-        floatArrayOf(0.58f, 0.10f), floatArrayOf(0.70f, 0.20f), floatArrayOf(0.84f, 0.09f),
-        floatArrayOf(0.90f, 0.24f), floatArrayOf(0.22f, 0.24f), floatArrayOf(0.52f, 0.28f)
-    )
-
     init {
         holder.addCallback(this)
         isFocusable = true
         best = prefs.getInt("best", 0)
-        nightMode = prefs.getBoolean("night", false)
+        coins = prefs.getInt("coins", 0)
+        val mask = prefs.getInt("unlocked", 1)
+        for (i in unlocked.indices) unlocked[i] = i == 0 || (mask and (1 shl i)) != 0
+        skin = prefs.getInt("skin", 0).coerceIn(0, skinPalettes.size - 1)
+        if (!unlocked[skin]) skin = 0   // на всякий случай: не даём носить незакрытый скин
         sound.musicVolume = prefs.getFloat("musicVol", 0.6f)
         sound.soundVolume = prefs.getFloat("soundVol", 0.8f)
         sound.musicMuted = prefs.getBoolean("musicMuted", false)
@@ -237,67 +313,56 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         }
     }
 
-    /** Палитра города под выбранную тему. */
+    /** Дневная палитра города. */
     private fun applyTheme() {
-        if (nightMode) {
-            skyBands = intArrayOf(
-                Color.rgb(12, 16, 46), Color.rgb(26, 26, 70),
-                Color.rgb(48, 38, 88), Color.rgb(74, 54, 100)
-            )
-            celestialPaint.color = Color.rgb(236, 238, 216)
-            celestialShadePaint.color = Color.rgb(210, 214, 190)
-            cityFarPaint.color = Color.rgb(38, 42, 72)
-            cityNearPaint.color = Color.rgb(26, 28, 52)
-            winLitPaint.color = Color.rgb(255, 214, 120)
-            winDarkPaint.color = Color.rgb(34, 38, 62)
-            winThreshold = 0.55f
-            pavementPaint.color = Color.rgb(46, 50, 66)
-            curbPaint.color = Color.rgb(66, 72, 92)
-            tilePaint.color = Color.rgb(34, 38, 52)
-            btnPanelPaint.color = Color.rgb(30, 34, 56)
-            btnTextColor = Color.rgb(240, 244, 255)
-            obsBody.color = Color.rgb(74, 60, 92)
-            obsEdge.color = Color.rgb(52, 42, 68)
-            obsRoof.color = Color.rgb(38, 30, 52)
-            obsWinLit.color = Color.rgb(255, 214, 120)
-            obsWinDark.color = Color.rgb(46, 40, 64)
-            titleTop = Color.rgb(78, 128, 240)      // ночь: верх синий
-            titleBottom = Color.rgb(150, 72, 214)    // низ фиолетовый
-        } else {
-            skyBands = intArrayOf(
-                Color.rgb(58, 140, 230), Color.rgb(86, 162, 240),
-                Color.rgb(120, 190, 250), Color.rgb(162, 214, 255)
-            )
-            celestialPaint.color = Color.rgb(255, 231, 120)
-            celestialShadePaint.color = Color.rgb(255, 214, 90)
-            cityFarPaint.color = Color.rgb(150, 172, 206)
-            cityNearPaint.color = Color.rgb(120, 148, 190)
-            winLitPaint.color = Color.rgb(206, 230, 252)
-            winDarkPaint.color = Color.rgb(96, 124, 164)
-            winThreshold = 0.5f
-            pavementPaint.color = Color.rgb(150, 156, 168)
-            curbPaint.color = Color.rgb(182, 188, 200)
-            tilePaint.color = Color.rgb(122, 128, 140)
-            btnPanelPaint.color = Color.rgb(228, 240, 255)
-            btnTextColor = Color.rgb(40, 54, 92)
-            obsBody.color = Color.rgb(180, 186, 194)   // день: тело дома-препятствия серое
-            obsEdge.color = Color.rgb(150, 156, 164)   // день: боковая грань темнее
-            obsRoof.color = Color.rgb(120, 126, 134)   // день: крыша самая тёмная
-            obsWinLit.color = Color.rgb(224, 228, 234)
-            obsWinDark.color = Color.rgb(138, 144, 152)
-            titleTop = Color.rgb(255, 224, 90)       // день: жёлто-оранжевый
-            titleBottom = Color.rgb(232, 120, 24)
-        }
-        textCache.clear()   // цвет заголовка сменился — сбрасываем кэш текста
+        skyBands = intArrayOf(
+            Color.rgb(58, 140, 230), Color.rgb(86, 162, 240),
+            Color.rgb(120, 190, 250), Color.rgb(162, 214, 255)
+        )
+        celestialPaint.color = Color.rgb(255, 231, 120)
+        cityFarPaint.color = Color.rgb(150, 172, 206)
+        cityNearPaint.color = Color.rgb(120, 148, 190)
+        winLitPaint.color = Color.rgb(206, 230, 252)
+        winDarkPaint.color = Color.rgb(96, 124, 164)
+        winThreshold = 0.5f
+        pavementPaint.color = Color.rgb(150, 156, 168)
+        curbPaint.color = Color.rgb(182, 188, 200)
+        tilePaint.color = Color.rgb(122, 128, 140)
+        btnPanelPaint.color = Color.rgb(228, 240, 255)
+        btnTextColor = Color.rgb(40, 54, 92)
+        obsBody.color = Color.rgb(180, 186, 194)   // тело дома-препятствия серое
+        obsEdge.color = Color.rgb(150, 156, 164)   // боковая грань темнее
+        obsRoof.color = Color.rgb(120, 126, 134)   // крыша самая тёмная
+        obsWinLit.color = Color.rgb(224, 228, 234)
+        obsWinDark.color = Color.rgb(138, 144, 152)
+        titleTop = Color.rgb(255, 224, 90)         // жёлто-оранжевый
+        titleBottom = Color.rgb(232, 120, 24)
+        textCache.clear()
     }
 
-    /** Геометрия шестерёнки и окна настроек (зависит от размеров экрана). */
+    /** Геометрия шестерёнки, кнопки магазина и окна настроек (зависит от размеров экрана). */
     private fun layoutSettings() {
         val g = w * 0.11f
         gearBtn.set(w - g - w * 0.04f, h * 0.03f, w - w * 0.04f, h * 0.03f + g)
+        // Кнопка магазина — под шестернёй, тот же размер и правый отступ.
+        val shopTop = gearBtn.bottom + g * 0.28f
+        shopBtn.set(gearBtn.left, shopTop, gearBtn.right, shopTop + g)
+
+        // Экран магазина: стрелка «назад» слева сверху и ряд скинов по центру.
+        shopBackBtn.set(w * 0.05f, h * 0.05f, w * 0.05f + g, h * 0.05f + g)
+        val slot = w * 0.22f
+        val gap = w * 0.06f
+        val n = skinSlots.size
+        val rowW = n * slot + (n - 1) * gap
+        val startX = (w - rowW) / 2f
+        val cy = h * 0.46f
+        for (i in skinSlots.indices) {
+            val l = startX + i * (slot + gap)
+            skinSlots[i].set(l, cy - slot / 2f, l + slot, cy + slot / 2f)
+        }
 
         val pw = w * 0.86f
-        val ph = h * 0.52f
+        val ph = h * 0.42f
         val pl = (w - pw) / 2f
         val pt = (h - ph) / 2f
         panel.set(pl, pt, pl + pw, pt + ph)
@@ -317,9 +382,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         val muteL = pl + pw * 0.74f
         musicMuteBtn.set(muteL, musicY - ms / 2f, muteL + ms, musicY + ms / 2f)
         soundMuteBtn.set(muteL, soundY - ms / 2f, muteL + ms, soundY + ms / 2f)
-
-        settingsThemeBtn.set(pl + pw * 0.22f, pt + ph * 0.80f, pl + pw * 0.78f, pt + ph * 0.92f)
-        themeBtn.set(settingsThemeBtn)
     }
 
     private fun resetGame() {
@@ -329,10 +391,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         state = State.READY
     }
 
-    private fun toggleTheme() {
-        nightMode = !nightMode
-        prefs.edit().putBoolean("night", nightMode).apply()
-        applyTheme()
+    private fun selectSkin(index: Int) {
+        if (index !in skinPalettes.indices) return
+        skin = index
+        prefs.edit { putInt("skin", skin) }
     }
 
     private fun spawnPipe(atX: Float) {
@@ -364,7 +426,13 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
                 while (iter.hasNext()) {
                     val p = iter.next()
                     p.update(dt, pipeSpeed)
-                    if (!p.passed && p.x + p.width < bird.x) { p.passed = true; score++; sound.playScore() }
+                    if (!p.passed && p.x + p.width < bird.x) {
+                        p.passed = true; score++; sound.playScore()
+                        if (score % 5 == 0) {   // каждые 5 очков — монета
+                            coins++
+                            prefs.edit { putInt("coins", coins) }
+                        }
+                    }
                     if (p.collidesWith(bird.x, bird.y, bird.radius, groundY)) gameOver()
                     if (p.isOffScreen()) iter.remove()
                 }
@@ -380,7 +448,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         state = State.GAME_OVER
         if (score > best) {
             best = score
-            prefs.edit().putInt("best", best).apply()
+            prefs.edit { putInt("best", best) }
         }
     }
 
@@ -388,14 +456,18 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         val x = event.x; val y = event.y
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                when (state) {
-                    State.LOADING -> {}
-                    State.READY ->
-                        if (settingsOpen) settingsDown(x, y)
-                        else if (gearBtn.contains(x, y)) settingsOpen = true
-                        else { state = State.PLAYING; bird.reset(bird.y); bird.flap() }
-                    State.PLAYING -> bird.flap()
-                    State.GAME_OVER -> resetGame()
+                synchronized(lock) {
+                    when (state) {
+                        State.LOADING -> {}
+                        State.READY ->
+                            if (shopOpen) shopDown(x, y)
+                            else if (settingsOpen) settingsDown(x, y)
+                            else if (gearBtn.contains(x, y)) settingsOpen = true
+                            else if (shopBtn.contains(x, y)) shopOpen = true
+                            else { state = State.PLAYING; bird.reset(bird.y); bird.flap() }
+                        State.PLAYING -> bird.flap()
+                        State.GAME_OVER -> resetGame()
+                    }
                 }
                 performClick()
                 return true
@@ -405,10 +477,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (activeSlider != 0) {
-                    prefs.edit()
-                        .putFloat("musicVol", sound.musicVolume)
-                        .putFloat("soundVol", sound.soundVolume)
-                        .apply()
+                    prefs.edit {
+                        putFloat("musicVol", sound.musicVolume)
+                        putFloat("soundVol", sound.soundVolume)
+                    }
                     activeSlider = 0
                 }
                 return true
@@ -422,17 +494,51 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         if (closeBtn.contains(x, y)) { settingsOpen = false; return }
         if (musicMuteBtn.contains(x, y)) {
             sound.musicMuted = !sound.musicMuted
-            prefs.edit().putBoolean("musicMuted", sound.musicMuted).apply()
+            prefs.edit { putBoolean("musicMuted", sound.musicMuted) }
             sound.applyMusicVolume(); return
         }
         if (soundMuteBtn.contains(x, y)) {
             sound.soundMuted = !sound.soundMuted
-            prefs.edit().putBoolean("soundMuted", sound.soundMuted).apply(); return
+            prefs.edit { putBoolean("soundMuted", sound.soundMuted) }; return
         }
-        if (settingsThemeBtn.contains(x, y)) { toggleTheme(); return }
         if (hitTrack(musicTrack, x, y)) { activeSlider = 1; sliderTo(x); return }
         if (hitTrack(soundTrack, x, y)) { activeSlider = 2; sliderTo(x); return }
         if (!panel.contains(x, y)) settingsOpen = false   // тап мимо окна — закрыть
+    }
+
+    /**
+     * Системная кнопка «Назад»: закрывает открытое окно (магазин/настройки).
+     * Возвращает true, если событие поглощено; false — обрабатывать по умолчанию.
+     */
+    fun onBackPressed(): Boolean = synchronized(lock) {
+        when {
+            shopOpen -> { shopOpen = false; true }
+            settingsOpen -> { settingsOpen = false; activeSlider = 0; true }
+            else -> false
+        }
+    }
+
+    /** Обработка нажатия на экране магазина. */
+    private fun shopDown(x: Float, y: Float) {
+        if (shopBackBtn.contains(x, y)) { shopOpen = false; return }
+        for (i in skinSlots.indices) {
+            if (skinSlots[i].contains(x, y)) { tapSkin(i); return }
+        }
+    }
+
+    /** Тап по иконке скина: если открыт — надеть, иначе купить (при хватке монет). */
+    private fun tapSkin(index: Int) {
+        if (index !in unlocked.indices) return
+        if (unlocked[index]) { selectSkin(index); return }
+        if (coins >= skinPrices[index]) {
+            coins -= skinPrices[index]
+            unlocked[index] = true
+            var mask = 0
+            for (j in unlocked.indices) if (unlocked[j]) mask = mask or (1 shl j)
+            prefs.edit { putInt("coins", coins); putInt("unlocked", mask) }
+            selectSkin(index)
+        }
+        // недостаточно монет — ничего не делаем
     }
 
     private fun hitTrack(t: RectF, x: Float, y: Float): Boolean {
@@ -456,14 +562,16 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     // ---- Рендеринг ----
     fun render(canvas: Canvas) {
         if (w == 0f) return
+        // Магазин — отдельный полноэкранный экран поверх игры.
+        if (shopOpen && state == State.READY) { drawShop(canvas); return }
         drawSky(canvas)
-        if (nightMode) drawStars(canvas) else drawClouds(canvas)
+        drawClouds(canvas)
         drawCity(canvas, cityFarPaint, w * 0.26f, 0.30f, 0.22f, 0.25f)
         drawCity(canvas, cityNearPaint, w * 0.17f, 0.16f, 0.20f, 0.45f)
         if (state != State.LOADING) for (p in pipes) drawPipe(canvas, p)
         drawGround(canvas)
         if (state != State.LOADING) drawBird(canvas)
-        if (state == State.LOADING) drawLoading(canvas) else drawHud(canvas)
+        if (state == State.LOADING) drawLoading(canvas) else { drawHud(canvas); drawCoinHud(canvas) }
         if (settingsOpen && state == State.READY) drawSettings(canvas)
     }
 
@@ -474,43 +582,15 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
             bandPaint.color = skyBands[i]
             canvas.drawRect(0f, i * bandH, w, (i + 1) * bandH + 1f, bandPaint)
         }
+        // Солнце слева сверху.
         val s = w * 0.10f
-        if (nightMode) {
-            // Луна с кратерами, справа сверху.
-            val cx = w * 0.82f; val cy = h * 0.11f
-            canvas.drawRect(cx, cy, cx + s, cy + s, celestialPaint)
-            val cc = s * 0.22f
-            canvas.drawRect(cx - cc, cy + cc, cx, cy + s - cc, celestialPaint)
-            canvas.drawRect(cx + s, cy + cc, cx + s + cc, cy + s - cc, celestialPaint)
-            canvas.drawRect(cx + cc, cy - cc, cx + s - cc, cy, celestialPaint)
-            canvas.drawRect(cx + cc, cy + s, cx + s - cc, cy + s + cc, celestialPaint)
-            canvas.drawRect(cx + s * 0.2f, cy + s * 0.25f, cx + s * 0.42f, cy + s * 0.47f, celestialShadePaint)
-            canvas.drawRect(cx + s * 0.55f, cy + s * 0.55f, cx + s * 0.72f, cy + s * 0.72f, celestialShadePaint)
-        } else {
-            // Солнце слева сверху.
-            val sx = w * 0.10f; val sy = h * 0.10f
-            canvas.drawRect(sx, sy, sx + s, sy + s, celestialPaint)
-            val c = s * 0.22f
-            canvas.drawRect(sx - c, sy + c, sx, sy + s - c, celestialPaint)
-            canvas.drawRect(sx + s, sy + c, sx + s + c, sy + s - c, celestialPaint)
-            canvas.drawRect(sx + c, sy - c, sx + s - c, sy, celestialPaint)
-            canvas.drawRect(sx + c, sy + s, sx + s - c, sy + s + c, celestialPaint)
-        }
-    }
-
-    private fun drawStars(canvas: Canvas) {
-        val time = System.currentTimeMillis() / 360.0
-        for (i in starPts.indices) {
-            val p = starPts[i]
-            val cx = p[0] * w
-            val cy = p[1] * groundY
-            // Мерцание: размер плавно пульсирует у каждой звезды со своей фазой.
-            val tw = 0.5f + 0.5f * sin(time + i * 1.7).toFloat()
-            val s = w * 0.018f * (0.45f + 0.55f * tw)
-            val t = s * 0.32f
-            canvas.drawRect(cx - t, cy - s, cx + t, cy + s, starPaint)
-            canvas.drawRect(cx - s, cy - t, cx + s, cy + t, starPaint)
-        }
+        val sx = w * 0.10f; val sy = h * 0.10f
+        canvas.drawRect(sx, sy, sx + s, sy + s, celestialPaint)
+        val c = s * 0.22f
+        canvas.drawRect(sx - c, sy + c, sx, sy + s - c, celestialPaint)
+        canvas.drawRect(sx + s, sy + c, sx + s + c, sy + s - c, celestialPaint)
+        canvas.drawRect(sx + c, sy - c, sx + s - c, sy, celestialPaint)
+        canvas.drawRect(sx + c, sy + s, sx + s - c, sy + s + c, celestialPaint)
     }
 
     private fun drawClouds(canvas: Canvas) {
@@ -613,29 +693,31 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
 
     private fun drawBird(canvas: Canvas) {
         val p = birdPixel
-        canvas.save()
-        canvas.translate(bird.x, bird.y)
-        val tilt = (bird.velocity / (h * 1.4f)).coerceIn(-0.5f, 0.9f)
-        canvas.rotate(Math.toDegrees(tilt.toDouble()).toFloat())
-        val ox = -birdBody[0].length * p / 2f
-        val oy = -birdBody.size * p / 2f
-        val body = if (nightMode) batBody else birdBody
-        drawSprite(canvas, body, ox, oy, p)
-        val phase = (System.currentTimeMillis() / 90) % 4
-        val wing = if (nightMode) when (phase) {
-            0L -> batWingUp; 1L -> batWingMid; 2L -> batWingDown; else -> batWingMid
-        } else when (phase) {
-            0L -> wingUp; 1L -> wingMid; 2L -> wingDown; else -> wingMid
+        canvas.withSave {
+            translate(bird.x, bird.y)
+            val tilt = (bird.velocity / (h * 1.4f)).coerceIn(-0.5f, 0.9f)
+            rotate(Math.toDegrees(tilt.toDouble()).toFloat())
+            val body = skinBodies[skin]
+            val ox = -body[0].length * p / 2f
+            val oy = -body.size * p / 2f
+            val palette = skinPalettes[skin]
+            drawSprite(this, body, ox, oy, p, palette)
+            val phase = (System.currentTimeMillis() / 90) % 4
+            val wing = when (phase) {
+                0L -> wingUp; 1L -> wingMid; 2L -> wingDown; else -> wingMid
+            }
+            drawSprite(this, wing, ox + wingCol * p, oy + wingRow * p, p, palette)
         }
-        drawSprite(canvas, wing, ox + wingCol * p, oy + wingRow * p, p)
-        canvas.restore()
     }
 
-    private fun drawSprite(canvas: Canvas, rows: Array<String>, ox: Float, oy: Float, p: Float) {
+    private fun drawSprite(
+        canvas: Canvas, rows: Array<String>, ox: Float, oy: Float, p: Float,
+        palette: HashMap<Char, Paint> = px
+    ) {
         for (r in rows.indices) {
             val row = rows[r]
             for (c in row.indices) {
-                val paint = px[row[c]] ?: continue
+                val paint = palette[row[c]] ?: continue
                 val l = ox + c * p
                 val t = oy + r * p
                 canvas.drawRect(l, t, l + p + 0.6f, t + p + 0.6f, paint)
@@ -668,6 +750,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
                 centeredText(canvas, "Нажми, чтобы начать", w / 2f, h * 0.60f, w * 0.05f)
                 if (best > 0) centeredText(canvas, "Рекорд: $best", w / 2f, h * 0.67f, w * 0.05f)
                 drawGear(canvas)
+                drawShopButton(canvas)
             }
             State.PLAYING -> centeredText(canvas, "$score", w / 2f, h * 0.16f, w * 0.14f)
             State.GAME_OVER -> {
@@ -706,6 +789,124 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         canvas.drawRect(cx - hr, cy - hr, cx + hr, cy + hr, gearBgPaint)
     }
 
+    /** Кнопка магазина: жёлтый скруглённый квадрат + белая иконка витрины. */
+    private fun drawShopButton(canvas: Canvas) {
+        val b = shopBtn
+        val bgR = b.width() * 0.22f
+        canvas.drawRoundRect(b, bgR, bgR, shopBgPaint)
+        val cx = b.centerX(); val cy = b.centerY()
+        val s = b.width() * 0.30f
+        // Навес.
+        canvas.drawRect(cx - s, cy - s * 0.9f, cx + s, cy - s * 0.4f, shopInk)
+        // Корпус.
+        canvas.drawRect(cx - s * 0.8f, cy - s * 0.4f, cx + s * 0.8f, cy + s, shopInk)
+        // Дверной проём (вырез цветом фона).
+        canvas.drawRect(cx - s * 0.25f, cy - s * 0.05f, cx + s * 0.25f, cy + s, shopBgPaint)
+    }
+
+    /** Экран магазина: жёлтый фон, стрелка «назад», счётчик монет, ряд скинов. */
+    private fun drawShop(canvas: Canvas) {
+        canvas.drawRect(0f, 0f, w, h, shopScreenPaint)
+        drawBackArrow(canvas)
+        drawShopCoins(canvas)
+
+        // Оранжевые полоски сверху и снизу ряда скинов.
+        val row = skinSlots[0]
+        val left = w * 0.08f
+        val right = w - w * 0.08f
+        val barH = h * 0.010f
+        canvas.drawRect(left, row.top - h * 0.05f, right, row.top - h * 0.05f + barH, stripePaint)
+        canvas.drawRect(left, row.bottom + h * 0.05f, right, row.bottom + h * 0.05f + barH, stripePaint)
+
+        for (i in skinSlots.indices) {
+            val slot = skinSlots[i]
+            val r = slot.height() * 0.16f
+            canvas.drawRoundRect(slot, r, r, skinSlotPaint)
+            drawSkinPreview(canvas, i, slot)
+            if (!unlocked[i]) {
+                drawLockedOverlay(canvas, i, slot, r)
+            } else if (i == skin) {
+                skinSelPaint.strokeWidth = slot.height() * 0.06f
+                canvas.drawRoundRect(slot, r, r, skinSelPaint)
+            }
+        }
+    }
+
+    /** Затемнение поверх закрытого скина + его цена (монета + число) по центру. */
+    private fun drawLockedOverlay(canvas: Canvas, index: Int, slot: RectF, r: Float) {
+        canvas.drawRoundRect(slot, r, r, lockDimPaint)
+        val priceTxt = "${skinPrices[index]}"
+        val ps = slot.height() * 0.22f
+        uiTextPaint.textSize = ps
+        val tw = uiTextPaint.measureText(priceTxt)
+        val cr = ps * 0.55f
+        val gap = ps * 0.25f
+        val total = cr * 2f + gap + tw
+        val startX = slot.centerX() - total / 2f
+        val cy = slot.centerY()
+        drawCoin(canvas, startX + cr, cy, cr)
+        leftText(canvas, priceTxt, startX + cr * 2f + gap, cy, ps, textWhite)
+    }
+
+    /** Счётчик монет в магазине: справа сверху, на уровне стрелки «назад». */
+    private fun drawShopCoins(canvas: Canvas) {
+        val cy = shopBackBtn.centerY()
+        val r = shopBackBtn.height() * 0.46f
+        val size = shopBackBtn.height() * 0.78f
+        val txt = "$coins"
+        uiTextPaint.textSize = size
+        val tw = uiTextPaint.measureText(txt)
+        val numX = w - w * 0.06f - tw
+        drawCoin(canvas, numX - r * 1.3f, cy, r)
+        leftText(canvas, txt, numX, cy, size, Color.rgb(70, 45, 0))
+    }
+
+    /** Счётчик монет в игре: монета + число в левом верхнем углу. */
+    private fun drawCoinHud(canvas: Canvas) {
+        val r = w * 0.048f
+        val cx = w * 0.11f
+        val cy = h * 0.06f
+        drawCoin(canvas, cx, cy, r)
+        leftText(canvas, "$coins", cx + r * 1.5f, cy, r * 2.1f, textWhite)
+    }
+
+    /** Пиксель-независимая золотая монета радиуса r с центром (cx, cy). */
+    private fun drawCoin(canvas: Canvas, cx: Float, cy: Float, r: Float) {
+        canvas.drawCircle(cx, cy, r, coinRimPaint)
+        canvas.drawCircle(cx, cy, r * 0.80f, coinFillPaint)
+        coinEdgePaint.strokeWidth = r * 0.13f
+        canvas.drawCircle(cx, cy, r * 0.52f, coinEdgePaint)
+        canvas.drawCircle(cx - r * 0.30f, cy - r * 0.34f, r * 0.15f, coinShinePaint)
+    }
+
+    /** Белая стрелка влево в левом верхнем углу магазина. */
+    private fun drawBackArrow(canvas: Canvas) {
+        val b = shopBackBtn
+        val cx = b.centerX(); val cy = b.centerY()
+        val s = b.width() * 0.30f
+        val head = Path().apply {
+            moveTo(cx - s, cy)
+            lineTo(cx, cy - s)
+            lineTo(cx, cy + s)
+            close()
+        }
+        canvas.drawPath(head, shopInk)
+        canvas.drawRect(cx - s * 0.2f, cy - s * 0.28f, cx + s, cy + s * 0.28f, shopInk)
+    }
+
+    /** Превью скина: тот же силуэт птицы, вписанный в ячейку, палитрой скина. */
+    private fun drawSkinPreview(canvas: Canvas, index: Int, slot: RectF) {
+        val palette = skinPalettes[index]
+        val body = skinBodies[index]
+        val cols = body[0].length
+        val rows = body.size
+        val p = slot.width() * 0.72f / cols
+        val ox = slot.centerX() - cols * p / 2f
+        val oy = slot.centerY() - rows * p / 2f
+        drawSprite(canvas, body, ox, oy, p, palette)
+        drawSprite(canvas, wingMid, ox + wingCol * p, oy + wingRow * p, p, palette)
+    }
+
     private fun drawSettings(canvas: Canvas) {
         canvas.drawRect(0f, 0f, w, h, dimPaint)
         val pr = panel.height() * 0.06f
@@ -715,13 +916,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
 
         drawSlider(canvas, "Музыка", musicTrack, sound.musicVolume, musicMuteBtn, sound.musicMuted)
         drawSlider(canvas, "Звуки", soundTrack, sound.soundVolume, soundMuteBtn, sound.soundMuted)
-
-        // Кнопка темы внутри настроек.
-        val br = settingsThemeBtn.height() * 0.28f
-        canvas.drawRoundRect(settingsThemeBtn, br, br, ctrlPaint)
-        val themeLabel = if (nightMode) "Тема: Ночь" else "Тема: День"
-        centeredText(canvas, themeLabel, settingsThemeBtn.centerX(), settingsThemeBtn.centerY(),
-            settingsThemeBtn.height() * 0.42f, knobPaint.color)
 
         // Крестик закрытия.
         val cr = closeBtn.height() * 0.28f
@@ -795,7 +989,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     }
 
     private fun pixelTitle(canvas: Canvas, text: String, cx: Float, cy: Float, size: Float) =
-        blitText(canvas, buildText(text, size, 0, true), cx, cy, size)
+        blitText(canvas, buildText(text, size), cx, cy, size)
 
     private fun blitText(canvas: Canvas, bmp: Bitmap, cx: Float, cy: Float, size: Float) {
         val scale = (size / 11f).toInt().coerceIn(2, 12)
@@ -806,11 +1000,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         canvas.drawBitmap(bmp, null, RectF(left, top, left + dw, top + dh), blitPaint)
     }
 
-    /** Мелкий Bitmap строки: тёмная обводка + заливка (сплошная или градиент). */
-    private fun buildText(text: String, size: Float, fill: Int, gradient: Boolean): Bitmap {
+    /** Мелкий Bitmap строки заголовка: тёмная обводка + градиентная заливка. */
+    private fun buildText(text: String, size: Float): Bitmap {
         val scale = (size / 11f).toInt().coerceIn(2, 12)
         val src = size / scale
-        val key = "$text|${src.toInt()}|$fill|$gradient"
+        val key = "$text|${src.toInt()}"
         textCache[key]?.let { return it }
         if (textCache.size > 128) textCache.clear()
 
@@ -820,7 +1014,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         val pad = 2
         val tw = Math.ceil(srcTextPaint.measureText(text).toDouble()).toInt().coerceAtLeast(1) + pad * 2
         val th = (fm.descent - fm.ascent).coerceAtLeast(1) + pad * 2
-        val bmp = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
+        val bmp = createBitmap(tw, th)
         val c = Canvas(bmp)
         val baseX = pad.toFloat()
         val baseY = (-fm.ascent + pad).toFloat()
@@ -829,13 +1023,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
             if (dx == 0 && dy == 0) continue
             c.drawText(text, baseX + dx, baseY + dy, srcTextPaint)
         }
-        if (gradient) {
-            srcTextPaint.shader = LinearGradient(
-                0f, baseY + fm.ascent, 0f, baseY + fm.descent, titleTop, titleBottom, Shader.TileMode.CLAMP
-            )
-        } else {
-            srcTextPaint.color = fill
-        }
+        srcTextPaint.shader = LinearGradient(
+            0f, baseY + fm.ascent, 0f, baseY + fm.descent, titleTop, titleBottom, Shader.TileMode.CLAMP
+        )
         c.drawText(text, baseX, baseY, srcTextPaint)
         srcTextPaint.shader = null
         textCache[key] = bmp
@@ -856,8 +1046,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        w = width.toFloat(); h = height.toFloat()
-        setupWorld()
+        synchronized(lock) {
+            w = width.toFloat(); h = height.toFloat()
+            setupWorld()
+        }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -865,7 +1057,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     }
 
     fun pause() {
-        gameOver()
+        synchronized(lock) { gameOver() }
         sound.onPause()
     }
 
@@ -899,11 +1091,13 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
                 var dt = (now - last) / 1_000_000_000f
                 last = now
                 if (dt > 0.05f) dt = 0.05f
-                update(dt)
+                // Единый замок: обновление состояния и рендер не должны пересекаться
+                // с обработчиком касаний (UI-поток), иначе редкий вылет на списке труб.
+                synchronized(lock) { update(dt) }
                 var canvas: Canvas? = null
                 try {
                     canvas = holder.lockCanvas()
-                    if (canvas != null) synchronized(holder) { render(canvas) }
+                    if (canvas != null) synchronized(lock) { render(canvas) }
                 } finally {
                     if (canvas != null) holder.unlockCanvasAndPost(canvas)
                 }
