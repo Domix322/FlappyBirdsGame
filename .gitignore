@@ -13,3 +13,8 @@
 .externalNativeBuild
 .cxx
 local.properties
+# Ключи подписи — никогда не коммитим
+*.jks
+*.keystore
+keystore.properties
+keystore.b64
