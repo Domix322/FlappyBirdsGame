@@ -23,6 +23,24 @@ class Pipe(
     /** Засчитано ли очко за прохождение этой трубы. */
     var passed: Boolean = false
 
+    /**
+     * Есть ли на этой трубе монета. Монеты появляются не на каждой трубе, а
+     * случайно раз в 4–7 труб (решение принимает GameView.spawnPipe).
+     */
+    var hasCoin: Boolean = false
+
+    /**
+     * Собрана ли монета, висящая в проёме этой трубы. Монета одна на пару труб,
+     * её центр — середина проёма (см. coinX/coinY). Собранная больше не рисуется.
+     */
+    var coinCollected: Boolean = false
+
+    /** X центра монеты в проёме (по центру трубы). */
+    val coinX: Float get() = x + width / 2f
+
+    /** Y центра монеты в проёме (по вертикали — середина зазора). */
+    val coinY: Float get() = gapTop + gapSize / 2f
+
     /** Движение влево за dt секунд. */
     fun update(dt: Float, speed: Float) {
         x -= speed * dt
