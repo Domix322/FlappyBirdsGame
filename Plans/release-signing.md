@@ -6,8 +6,9 @@
 - `app/build.gradle.kts` содержит `signingConfigs.release`, который читает данные
   ключа из переменных окружения. Если переменных нет — release собирается без
   подписи (локальная разработка не ломается).
-- Сам keystore **не хранится в репозитории** (см. `.gitignore`). В CI он приходит
-  из секрета `KEYSTORE_BASE64` и декодируется во временный файл.
+- Keystore хранится в репозитории **в зашифрованном виде** — `keystore.jks.gpg`
+  (симметричное шифрование GPG AES-256). Сам `.jks` в репозиторий не попадает
+  (см. `.gitignore`). В CI файл расшифровывается парольной фразой из секрета.
 
 ## GitHub Secrets (Settings → Secrets and variables → Actions)
 
@@ -15,7 +16,7 @@
 
 | Секрет | Назначение |
 |--------|-----------|
-| `KEYSTORE_BASE64` | keystore (`.jks`), закодированный в base64 |
+| `KEYSTORE_GPG_PASSPHRASE` | парольная фраза для расшифровки `keystore.jks.gpg` |
 | `KEYSTORE_PASSWORD` | пароль хранилища |
 | `KEY_ALIAS` | алиас ключа (`flappybird`) |
 | `KEY_PASSWORD` | пароль ключа |
